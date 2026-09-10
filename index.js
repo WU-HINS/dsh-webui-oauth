@@ -29,6 +29,18 @@
  *       raw addresses (the HMAC key is generated once and stored next to
  *       the credentials with 0600 permissions).
  *
+ * 0.3.3 — post-login redirect scheme (fixes #6 / #7):
+ *
+ *   C4. postLoginRedirect() no longer hardcodes "http://". The scheme is now
+ *       resolved per request: explicit remote-web-ui.publicBaseUrl (trusted
+ *       only when its authority matches the incoming Host) → X-Forwarded-Proto
+ *       / RFC 7239 Forwarded → socket.encrypted → http. The authority already
+ *       came from the request Host (#6); this closes the remaining HTTPS
+ *       reverse-proxy case (#7) where the backend kept handing out http://
+ *       redirects and the browser died against the TLS port. The login page
+ *       carries a one-way client-side fallback (https page + same-origin
+ *       http:// target → upgrade to https).
+ *
  * 0.3.2 — v0.1.2-alpha.2 core compatibility (by dsh adaption):
  *
  *   C1. Event-stream WebSocket moved from /api/events.mux+/api/events.host
@@ -123,7 +135,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect }
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -662,6 +674,18 @@ if (MODE === 'setup') {
   sub.textContent = '此界面已启用身份认证，请登录后继续使用。';
 }
 function validUsername(name) { return /^[A-Za-z0-9_-]{3,32}$/.test(name); }
+function goTo(target) {
+  var url = (typeof target === 'string' && target) ? target : '/';
+  // 兜底（0.3.3）：页面跑在 https 下、后端却返回同源 http:// 地址时（旧后端 /
+  // 反代未下发 X-Forwarded-Proto），浏览器会拿明文请求去撞 TLS 端口 → 握手
+  // 失败、页面「点了没反应」。仅同 authority 单向升级 https，反向不动（不降级）。
+  try {
+    if (location.protocol === 'https:' && url.slice(0, 7) === 'http://') {
+      if (new URL(url).host === location.host) { location.href = 'https://' + url.slice(7); return; }
+    }
+  } catch (err) { /* fall through */ }
+  location.href = url;
+}
 f.addEventListener('submit', function (ev) {
   ev.preventDefault();
   var username = u.value.trim(), password = p.value, token = t ? t.value.trim() : '';
@@ -681,7 +705,7 @@ f.addEventListener('submit', function (ev) {
   fetch(MODE === 'setup' ? '/dsh-webui-auth/setup' : '/dsh-webui-auth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   }).then(function (r) { return r.json(); }).then(function (r) {
-    if (r && r.ok) { location.href = (r.redirect && typeof r.redirect === 'string') ? r.redirect : '/'; return; }
+    if (r && r.ok) { goTo(r.redirect); return; }
     b.disabled = false; b.textContent = MODE === 'setup' ? '创建账号' : '登录';
     if (r && r.error === 'rate-limited') show('尝试次数过多，请一分钟后重试');
     else if (r && r.error === 'setup-token-required') show('初始化令牌缺失或不正确（见 dsh 启动日志）');
@@ -878,15 +902,111 @@ function themePreference(ctx) {
 // 签名 cookie。插件登录成功只是第一道门，还必须引导浏览器完成核心的
 // token→cookie 交换，否则后续请求会被核心 401 拦截（死锁）。
 // authenticatedUrl(baseUrl) 返回带本进程 launch token 的应用根 URL。
-// baseUrl 用请求自身的 Host（保持反代/LAN 场景的 authority 一致）。
+// baseUrl 用请求自身的 Host（保持反代/LAN 场景的 authority 一致；#6），
+// scheme 由 resolveRedirectScheme 按请求实际使用的协议解析（0.3.3；#7）。
+const PUBLIC_BASE_NAMESPACE = 'remote-web-ui'
+
+// 取首个逗号分隔值并小写化（代理头可能被多级代理追加，如 "https,http"）。
+function firstHop(value) {
+  return typeof value === 'string' ? value.split(',')[0].trim().toLowerCase() : ''
+}
+
+// 从标准代理头解析原始请求协议：X-Forwarded-Proto 优先，其次 RFC 7239 Forwarded。
+// 仅接受 http/https 白名单值——同时杜绝 CRLF 头注入与任意 scheme 注入。
+function proxyProto(req) {
+  try {
+    const headers = req && req.headers
+    if (!headers) return null
+    const xfp = firstHop(headers['x-forwarded-proto'])
+    if (xfp === 'http' || xfp === 'https') return xfp
+    const forwarded = typeof headers.forwarded === 'string' ? headers.forwarded.split(',')[0] : ''
+    const m = /(?:^|;)\s*proto\s*=\s*"?([A-Za-z]+)"?/.exec(forwarded)
+    if (m) {
+      const p = m[1].toLowerCase()
+      if (p === 'http' || p === 'https') return p
+    }
+  } catch (e) { /* ignore */ }
+  return null
+}
+
+// 拆分 authority 为 hostname + 端口（未显式给端口时按 fallbackScheme 取默认值）。
+function splitAuthority(authority, fallbackScheme) {
+  const raw = String(authority || '').trim().toLowerCase()
+  let hostname = raw
+  let port = fallbackScheme === 'https' ? '443' : '80'
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']')
+    if (end !== -1) {
+      hostname = raw.slice(0, end + 1)
+      const rest = raw.slice(end + 1)
+      if (rest.startsWith(':')) port = rest.slice(1)
+    }
+  } else {
+    const i = raw.lastIndexOf(':')
+    if (i !== -1 && raw.indexOf(':') === i) {
+      hostname = raw.slice(0, i)
+      port = raw.slice(i + 1)
+    }
+  }
+  return { hostname, port }
+}
+
+// 操作者显式声明：dsh settings 的 remote-web-ui.publicBaseUrl（如
+// "https://dsh.example.com:8443"）。**仅当其 authority 与本次请求的 Host 一致**
+// 时才采信，因为：
+//   - 局域网直连（http://192.168.x.x:3080）若被改写成公网地址，会跨源跳转、
+//     丢掉刚下发的插件会话 Cookie（登录死循环）；
+//   - 不做 Host 匹配就等于把用户可控的 Host 变成开放重定向。
+function declaredScheme(ctx, host) {
+  try {
+    const settings = ctx.get('settings')
+    if (!settings || typeof settings.get !== 'function') return null
+    const section = settings.get(PUBLIC_BASE_NAMESPACE)
+    const raw = section && typeof section.publicBaseUrl === 'string' ? section.publicBaseUrl.trim() : ''
+    if (!raw) return null
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    const scheme = url.protocol.slice(0, -1)
+    const declared = splitAuthority(url.host, scheme)
+    const incoming = splitAuthority(host, scheme)
+    if (declared.hostname !== incoming.hostname || declared.port !== incoming.port) return null
+    return scheme
+  } catch (e) {
+    return null
+  }
+}
+
+// 解析跳转应使用的 scheme。优先级：
+//   1. 操作者显式声明（remote-web-ui.publicBaseUrl，且 authority 匹配）；
+//   2. 标准代理头 X-Forwarded-Proto / Forwarded: proto=；
+//   3. socket 自身是 TLS（插件直接终结 TLS 时 socket.encrypted 为 true）；
+//   4. 兜底 http。
+// 刻意**不**使用「非 IP 域名即 https」的猜测：那会把纯 http 的内网域名访问
+// （http://nas.local:3080）打成 https 死链。此类部署应显式声明 publicBaseUrl，
+// 或让反代下发 X-Forwarded-Proto。
+// 1/2 的取值都只影响「发起本次请求的那个浏览器」自身的跳转（三个调用点都在
+// 已认证响应内），且经白名单过滤，不构成跨用户影响，也不构成开放重定向。
+function resolveRedirectScheme(ctx, req, host) {
+  const declared = declaredScheme(ctx, host)
+  if (declared) return declared
+  const proxied = proxyProto(req)
+  if (proxied) return proxied
+  try {
+    if (req && req.socket && req.socket.encrypted === true) return 'https'
+  } catch (e) { /* ignore */ }
+  return 'http'
+}
+
 function postLoginRedirect(ctx, req) {
   try {
     const conn = ctx.get('connection')
     if (!conn || typeof conn.authenticatedUrl !== 'function') return '/'
-    const host = (req && req.headers && typeof req.headers.host === 'string' && req.headers.host)
-      ? req.headers.host
-      : ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
-    return conn.authenticatedUrl('http://' + host)
+    const headerHost = (req && req.headers && typeof req.headers.host === 'string' && req.headers.host.trim())
+      ? req.headers.host.trim()
+      : ''
+    const host = headerHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
+    const scheme = headerHost ? resolveRedirectScheme(ctx, req, host) : 'http'
+    return conn.authenticatedUrl(scheme + '://' + host)
   } catch (e) {
     return '/'
   }
