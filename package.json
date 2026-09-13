@@ -4,7 +4,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node test/redirect-scheme.test.mjs && node test/oidc.test.mjs && node test/oidc-integration.test.mjs && node test/displace-original.test.mjs"
+    "test": "node test/redirect-scheme.test.mjs && node test/oidc.test.mjs && node test/oidc-integration.test.mjs && node test/oidc-config-store.test.mjs && node test/adopt-data-dir.test.mjs && node test/displace-original.test.mjs"
   },
   "exports": {
     ".": "./index.js",

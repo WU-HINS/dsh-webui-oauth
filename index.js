@@ -200,7 +200,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath }
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -266,35 +266,87 @@ function resolveDataDirFrom(dir) {
  * 这里检查【同级】是否存在原版目录且含凭据；有则优先复用它，实现无缝接管。
  * 仅在自身目录尚无凭据时才复用，避免覆盖本插件已经产生的数据。
  */
-function adoptSiblingDataDir(selfDir) {
-  if (!selfDir) return selfDir
-  try {
+function adoptOriginalDataDir(selfDir) {
+  // 自身已有凭据：不接管，避免覆盖用户已在新插件里建立的数据。
+  if (selfDir) {
+    try {
+      accessSync(selfDir + '/dsh-webui-auth.json', fsConstants.R_OK)
+      return selfDir
+    } catch (e) { /* 自身无凭据：继续向下查找 */ }
+  }
+  const candidates = []
+  // 1) 同级目录（源码 / link 安装最常见）
+  if (selfDir) {
     const norm = selfDir.replace(/\\/g, '/')
     const slash = norm.lastIndexOf('/')
-    if (slash <= 0) return selfDir
-    const parent = norm.slice(0, slash)
-    const base = norm.slice(slash + 1)
-    if (!base.startsWith('dsh-webui-')) return selfDir
-    const ownCred = selfDir + '/dsh-webui-auth.json'
-    let ownHasCred = true
-    try { accessSync(ownCred, fsConstants.R_OK) } catch (e) { ownHasCred = false }
-    if (ownHasCred) return selfDir // 自己已有数据：不动
-    const sibling = parent + '/dsh-webui-auth'
-    if (sibling === norm) return selfDir
-    try {
-      accessSync(sibling + '/dsh-webui-auth.json', fsConstants.R_OK)
-      return sibling
-    } catch (e) { return selfDir }
-  } catch (e) {
-    return selfDir
+    if (slash > 0) {
+      const base = norm.slice(slash + 1)
+      // 仅在目录名带 dsh-webui- 前缀时才认为"旁边可能躺着原版"，避免误认。
+      if (base.startsWith('dsh-webui-')) {
+        const sibling = norm.slice(0, slash) + '/dsh-webui-auth'
+        if (sibling !== norm) candidates.push(sibling)
+      }
+    }
   }
+  // 2) 原版兜底位置 $DSH_HOME/dsh-webui-auth/
+  try {
+    const legacy = legacyHomeDir()
+    if (!candidates.includes(legacy)) candidates.push(legacy)
+  } catch (e) { /* ignore */ }
+
+  for (const dir of candidates) {
+    try {
+      accessSync(dir + '/dsh-webui-auth.json', fsConstants.R_OK)
+      return dir
+    } catch (e) { /* 该候选无凭据：试下一个 */ }
+  }
+  return selfDir
 }
 
 const MODULE_DIR = pluginDir()
-const DATA_DIR = resolveDataDirFrom(adoptSiblingDataDir(MODULE_DIR))
 
+/**
+ * 数据目录。支持用 DSH_WEBUI_AUTH_DATA_DIR 显式覆盖——运维在容器/只读包体等
+ * 特殊部署下可指定位置；测试也依赖它把数据落到临时目录，避免污染源码目录。
+ */
+function resolveDataDir() {
+  const override = process.env.DSH_WEBUI_AUTH_DATA_DIR
+  if (typeof override === 'string' && override.trim()) {
+    const dir = override.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+    try {
+      mkdirSync(dir, { recursive: true })
+      accessSync(dir, fsConstants.W_OK)
+      return dir
+    } catch (e) { /* 不可写：忽略覆盖，走常规解析 */ }
+  }
+  return resolveDataDirFrom(adoptOriginalDataDir(MODULE_DIR))
+}
+
+const DATA_DIR = resolveDataDir()
+
+/**
+ * 凭据文件：**刻意沿用原版文件名** `dsh-webui-auth.json`。
+ * 这里存的是原版就有的 username / hash / ttl；换了名字用户的账号就找不到了。
+ */
 function configPath() {
   return DATA_DIR + '/dsh-webui-auth.json'
+}
+
+/**
+ * 本插件独有的配置文件：`dsh-webui-oauth.json`，目前存放 OIDC 段
+ * （issuer / clientId / clientSecret / scope / redirectBase / trustBrowserOrigin）。
+ *
+ * 为什么要独立成文件，而不是继续塞进 dsh-webui-auth.json 的 oidc 段：
+ *   1. 语义自洽——OIDC 是本插件独有的能力，原版没有这个功能，配置却存在
+ *      一个叫 dsh-webui-auth.json 的文件里，运维看目录会困惑"这份 secret
+ *      到底归谁"；
+ *   2. 让"接管/复制原版数据"安全——原版数据只有 dsh-webui-auth.json，
+ *      复制时不必担心把 clientSecret 复制成两份、两边各自修改而分叉；
+ *   3. 向后兼容——旧版曾把 oidc 段写在 dsh-webui-auth.json 里，读取时
+ *      仍会回落到那一段（见 readOidcConfig），首次写入新文件时完成迁移。
+ */
+function oidcConfigPath() {
+  return DATA_DIR + '/dsh-webui-oauth.json'
 }
 
 /** H3: 会话持久化文件（JSONL，一行一个会话）。 */
@@ -333,6 +385,49 @@ async function writeCredentials(ctx, creds) {
   ensureDataDir()
   const target = await ctx.fs.resolve(configPath())
   await ctx.fs.writeText(target, JSON.stringify(creds), undefined, undefined, { mode: 'danger-full-access' })
+}
+
+/**
+ * 读取 OIDC 配置。优先独立文件 dsh-webui-oauth.json；不存在时回落到
+ * dsh-webui-auth.json 的 oidc 段（旧版布局），实现无感升级。
+ * 返回 { oidc, legacy } —— legacy 为 true 表示来源是旧布局（下次写入会迁移）。
+ */
+async function readOidcConfig(ctx, creds) {
+  let raw = null
+  try {
+    const target = await ctx.fs.resolve(oidcConfigPath())
+    raw = await ctx.fs.readText(target)
+  } catch (e) {
+    raw = null
+  }
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && parsed.oidc && typeof parsed.oidc === 'object') {
+        return { oidc: parsed.oidc, legacy: false }
+      }
+    } catch (e) { /* 文件损坏：继续回落旧布局 */ }
+  }
+  // 旧布局：oidc 段曾在凭据文件里
+  const legacyOidc = creds && creds.oidc && typeof creds.oidc === 'object' ? creds.oidc : null
+  if (legacyOidc) return { oidc: legacyOidc, legacy: true }
+  return { oidc: null, legacy: false }
+}
+
+/** 写入 OIDC 配置（独立文件，0600 由数据目录权限兜底）。 */
+async function writeOidcConfig(ctx, oidc) {
+  ensureDataDir()
+  const target = await ctx.fs.resolve(oidcConfigPath())
+  await ctx.fs.writeText(target, JSON.stringify({ v: 1, oidc }), undefined, undefined, { mode: 'danger-full-access' })
+}
+
+/** 从凭据对象里剥离历史遗留的 oidc 段（迁移到独立文件后不再重复保存）。 */
+function stripLegacyOidc(creds) {
+  if (!creds || typeof creds !== 'object') return creds
+  if (!Object.prototype.hasOwnProperty.call(creds, 'oidc')) return creds
+  const copy = { ...creds }
+  delete copy.oidc
+  return copy
 }
 
 function isEnabled(creds) {
@@ -1607,11 +1702,14 @@ export async function apply(ctx) {
   // 状态一次消费即删，防 CSRF/重放；10 分钟过期，后台定时惰性清理。
   const oidcStates = new Map()
   const oidcDiscovery = makeDiscoveryCache()
-  function oidcOf(creds) {
-    return (creds && creds.oidc && typeof creds.oidc === 'object') ? creds.oidc : null
+  // OIDC 配置改由独立文件承载（dsh-webui-oauth.json），读取回落旧布局，
+  // 因此这里变成异步。oidcOf/oidcEnabled 统一走这条路径，避免各处各自读。
+  async function oidcOf(creds) {
+    const r = await readOidcConfig(ctx, creds)
+    return r.oidc
   }
-  function oidcEnabled(creds) {
-    const o = oidcOf(creds)
+  async function oidcEnabled(creds) {
+    const o = await oidcOf(creds)
     return !!(o && o.enabled === true && typeof o.issuer === 'string' && typeof o.clientId === 'string' && typeof o.clientSecret === 'string')
   }
   function purgeExpiredOidcStates() {
@@ -1628,7 +1726,7 @@ export async function apply(ctx) {
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
           const credsNow = await readCredentials(ctx)
-          const oidcOn = oidcEnabled(credsNow)
+          const oidcOn = await oidcEnabled(credsNow)
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
             .replace('__OIDC_ENABLED__', oidcOn ? 'true' : 'false')
@@ -1785,14 +1883,15 @@ export async function apply(ctx) {
         }
         const creds = await readCredentials(ctx)
         const enabled = isEnabled(creds)
-        const oidcOn = oidcEnabled(creds)
+        const oidcCfg = await oidcOf(creds)
+        const oidcOn = !!(oidcCfg && oidcCfg.enabled === true && typeof oidcCfg.issuer === 'string' && typeof oidcCfg.clientId === 'string' && typeof oidcCfg.clientSecret === 'string')
         sendJson(res, 200, {
           enabled,
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
           gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
-          oidc: oidcOn ? { enabled: true, issuer: oidcOf(creds).issuer, clientId: oidcOf(creds).clientId, scope: oidcOf(creds).scope, redirectBase: oidcOf(creds).redirectBase, trustBrowserOrigin: oidcOf(creds).trustBrowserOrigin !== false } : { enabled: false },
+          oidc: oidcOn ? { enabled: true, issuer: oidcCfg.issuer, clientId: oidcCfg.clientId, scope: oidcCfg.scope, redirectBase: oidcCfg.redirectBase, trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false } : { enabled: false },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -1907,7 +2006,9 @@ export async function apply(ctx) {
         // 合并 OIDC 配置：oidcIn 提供时整段替换（secret 留空则保留旧值）；否则关闭。
         let oidcOut = null
         if (oidcIn && typeof oidcIn.enabled === 'boolean' && typeof oidcIn.issuer === 'string' && typeof oidcIn.clientId === 'string') {
-          const prevSecret = (creds && creds.oidc && typeof creds.oidc.clientSecret === 'string') ? creds.oidc.clientSecret : ''
+          // 旧值可能来自旧布局（凭据文件内的 oidc 段），readOidcConfig 已做回落。
+          const prevCfg = (await readOidcConfig(ctx, creds)).oidc
+          const prevSecret = (prevCfg && typeof prevCfg.clientSecret === 'string') ? prevCfg.clientSecret : ''
           oidcOut = {
             enabled: oidcIn.enabled,
             issuer: oidcIn.issuer,
@@ -1926,8 +2027,11 @@ export async function apply(ctx) {
         } else {
           credsOut = { v: 3, username, hash: await hashPassword(password), ttl }
         }
-        if (oidcOut) credsOut.oidc = oidcOut
+        // 凭据文件只保留账号字段（OIDC 走独立文件）；写入时自然剥掉历史遗留的 oidc 段，
+        // 完成旧布局 → 新布局迁移，不让旧 secret 继续躺在凭据文件里。
         await writeCredentials(ctx, credsOut)
+        // OIDC 仅当本次请求涉及它时才写，避免"只改密码"把 OIDC 配置意外清掉。
+        if (oidcOut) await writeOidcConfig(ctx, oidcOut)
         enabledFlag = true
         if (wasEnabled) {
           const keepToken = cookieOf(req, COOKIE_NAME)
@@ -2000,8 +2104,8 @@ export async function apply(ctx) {
           return
         }
         const creds = await readCredentials(ctx)
-        const o = oidcOf(creds)
-        if (!oidcEnabled(creds)) {
+        const o = await oidcOf(creds)
+        if (!(await oidcEnabled(creds))) {
           sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
           return
         }
@@ -2067,8 +2171,8 @@ export async function apply(ctx) {
         const state = params.get('state')
         const meta = requestMeta(req)
         const creds = await readCredentials(ctx)
-        const o = oidcOf(creds)
-        if (!oidcEnabled(creds)) {
+        const o = await oidcOf(creds)
+        if (!(await oidcEnabled(creds))) {
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'OIDC 未配置' })
           sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
           return

@@ -18,7 +18,11 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 - **只按插件名匹配**，不会影响任何其他插件；找不到原版时静默继续。
 - **数据无缝衔接**：数据目录（`.dsh-webui-auth/`）与凭据文件（`dsh-webui-auth.json`）**刻意沿用原名**，原版创建的账号无需迁移即可登录。
-- 源码 / `link:` 安装时，若插件目录旁存在原版目录且其中已有凭据，本插件会优先复用该数据目录（仅在自身尚无凭据时）。
+- **接管原版数据目录**：当本插件自身尚无凭据时，会依次查找含凭据的原版数据目录并**直接复用**（不是复制——复制会产生两份凭据，改密码只改一边而分叉）：
+  1. 同级目录 `../dsh-webui-auth/`（源码 / `link:` 安装最常见）；
+  2. `$DSH_HOME/dsh-webui-auth/`（原版的兜底位置）。
+  两处都没有则用自己的目录（全新安装，走 setup token）。**自身已有凭据时一律不接管**，避免覆盖你已在新插件里建立的数据。
+- **OIDC 配置独立存放**：账号凭据留在 `dsh-webui-auth.json`，OIDC 配置（含 `clientSecret`）写入本插件自己的 `dsh-webui-oauth.json`；旧版曾把 `oidc` 段写在凭据文件里，读取时自动回落、保存时自动迁移。
 - 卸载原版、只留本插件同样正常工作。
 
 ## 架构
@@ -127,13 +131,16 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
 
 | 文件 | 用途 | 权限 |
 |---|---|---|
-| `dsh-webui-auth.json` | 凭据（scrypt 哈希，v3 格式；0.2.x 的 v2 凭据仍可正常登录校验）+ 可选 OIDC 配置段（v4 写入 `oidc` 字段） | — |
+| `dsh-webui-auth.json` | **账号凭据**（scrypt 哈希，v3 格式；0.2.x 的 v2 凭据仍可正常登录校验）。文件名沿用原版，保证升级不丢账号 | — |
+| `dsh-webui-oauth.json` | **本插件独有配置**（OIDC 段：`issuer` / `clientId` / `clientSecret` / `scope` / `redirectBase` / `trustBrowserOrigin`）。独立成文件，避免 OIDC 密钥与账号凭据混在一起 | — |
 | `audit.jsonl` | 审计日志（IP 已假名化，见「审计日志」节） | — |
 | `sessions.jsonl` | 持久化会话（重启恢复用） | 0600 |
 | `audit-hmac-key` | 审计 IP 假名化的 HMAC 密钥（首次自动生成） | 0600 |
 | `setup-token` | 首次初始化的 setup token（创建成功后删除） | 0600 |
 
-数据目录由安装方式决定（npm / GitHub / tarball → `node_modules` 上级的 `.dsh-webui-auth/`；link / 源码 → 插件源码目录；兜底 `$DSH_HOME/dsh-webui-auth/`），忘记密码、审计、会话路径均指该目录。
+数据目录由安装方式决定（npm / GitHub / tarball → `node_modules` 上级的 `.dsh-webui-auth/`；link / 源码 → 插件源码目录；兜底 `$DSH_HOME/dsh-webui-auth/`），忘记密码、审计、会话路径均指该目录。也可用环境变量 `DSH_WEBUI_AUTH_DATA_DIR` 显式指定数据目录（容器 / 只读包体等部署适用）。
+
+> **从旧版升级（OIDC 配置布局变更）**：早期版本把 `oidc` 段写在 `dsh-webui-auth.json` 里，现在改由 `dsh-webui-oauth.json` 承载。读取时**仍会回落到旧位置**（无感升级），并在你下次于设置页保存时自动迁移到新文件、同时从凭据文件剥离旧字段。
 
 ## 审计日志
 
@@ -167,7 +174,7 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
 - 登录页与 API 响应均带安全头：严格 CSP、`nosniff`、`DENY` 防嵌框、`no-referrer`、`noindex`、`no-store`。
 - Cookie `HttpOnly + SameSite=Lax`：JS 不可读、跨站请求不携带。
 - 登录/初始化端点本身公开（认证的必然入口）：`/dsh-webui-oauth/login`、`/dsh-webui-oauth/setup`（后者受 setup token 保护）。
-- **OIDC 单点登录**：authorization_code + PKCE + client_secret（机密客户端，不做纯 PKCE public client）；state 防 CSRF、nonce 防重放、redirect_uri 精确匹配（base + 固定路径）、id_token 经 JWKS 验签并校验 iss/aud/exp/iat/nbf/nonce、仅接受 HTTPS 端点；审计只记录经 `sanitizeSub` 过滤的 `sub`。OIDC 客户端配置（含 secret）与密码凭据同存于 `dsh-webui-auth.json`（0600 数据目录）。
+- **OIDC 单点登录**：authorization_code + PKCE + client_secret（机密客户端，不做纯 PKCE public client）；state 防 CSRF、nonce 防重放、redirect_uri 精确匹配（base + 固定路径）、id_token 经 JWKS 验签并校验 iss/aud/azp/exp/iat/nbf/nonce、仅接受 HTTPS 端点；审计只记录经 `sanitizeSub` 过滤的 `sub`。OIDC 客户端配置（含 secret）存于数据目录的 `dsh-webui-oauth.json`，与账号凭据分离。
 
 ## 已知边界
 

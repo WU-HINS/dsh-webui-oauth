@@ -18,7 +18,11 @@ So at startup (before installing its own gate) this plugin walks the cordis plug
 
 - **Matching is by plugin name only** — no other plugin is touched; if the original is absent, startup continues silently.
 - **Data carries over seamlessly**: the data directory (`.dsh-webui-auth/`) and credentials file (`dsh-webui-auth.json`) **deliberately keep their original names**, so accounts created by the original work without migration.
-- For source / `link:` installs, if the original's directory sits next to this one and already holds credentials, this plugin reuses that data directory (only when it has none of its own).
+- **Adopting the original's data directory**: when this plugin has no credentials of its own yet, it looks for an original data directory that already holds credentials and **reuses it directly** (not copies — copying would produce two credential sets that diverge as soon as one side changes the password):
+  1. the sibling directory `../dsh-webui-auth/` (the usual case for source / `link:` installs);
+  2. `$DSH_HOME/dsh-webui-auth/` (the original's fallback location).
+  If neither exists it uses its own directory (fresh install, driven by the setup token). **When it already has credentials it never adopts**, so data created under the new plugin is never overwritten.
+- **OIDC config lives in its own file**: account credentials stay in `dsh-webui-auth.json`, while the OIDC config (including `clientSecret`) goes to this plugin's own `dsh-webui-oauth.json`. Older versions kept the `oidc` section inside the credentials file — it is still read from there (transparent upgrade) and migrated on the next save.
 - Uninstalling the original and keeping only this plugin works too.
 
 ## Architecture
@@ -126,13 +130,16 @@ Files in the data directory:
 
 | File | Purpose | Permissions |
 |---|---|---|
-| `dsh-webui-auth.json` | Credentials (scrypt hash, v3 format; 0.2.x v2 credentials still verify and log in) | — |
+| `dsh-webui-auth.json` | **Account credentials** (scrypt hash, v3 format; 0.2.x v2 credentials still verify and log in). Keeps the original filename so upgrades never lose accounts | — |
+| `dsh-webui-oauth.json` | **This plugin's own config** (the OIDC section: `issuer` / `clientId` / `clientSecret` / `scope` / `redirectBase` / `trustBrowserOrigin`). A separate file keeps OIDC secrets apart from account credentials | — |
 | `audit.jsonl` | Audit log (IPs pseudonymized, see "Audit log") | — |
 | `sessions.jsonl` | Persisted sessions (restart recovery) | 0600 |
 | `audit-hmac-key` | HMAC key for audit-IP pseudonymization (auto-generated once) | 0600 |
 | `setup-token` | First-run setup token (deleted after setup succeeds) | 0600 |
 
-The data directory is chosen by install mode (npm / GitHub / tarball → `.dsh-webui-auth/` next to `node_modules`; link / source → the plugin source directory; fallback `$DSH_HOME/dsh-webui-auth/`); the "forgot password", audit and session paths above refer to that data directory.
+The data directory is chosen by install mode (npm / GitHub / tarball → `.dsh-webui-auth/` next to `node_modules`; link / source → the plugin source directory; fallback `$DSH_HOME/dsh-webui-auth/`); the "forgot password", audit and session paths above refer to that data directory. You can also pin it explicitly with the `DSH_WEBUI_AUTH_DATA_DIR` environment variable (useful for containers and read-only package trees).
+
+> **Upgrading from an older version (OIDC layout change)**: early builds stored the `oidc` section inside `dsh-webui-auth.json`; it now lives in `dsh-webui-oauth.json`. Reads still fall back to the old location (transparent upgrade), and the next save from the settings page migrates it to the new file while stripping the stale field from the credentials file.
 
 ## Audit log
 
@@ -166,7 +173,7 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 - Security headers on the login page and API responses: strict CSP, `nosniff`, `DENY` framing, `no-referrer`, `noindex`, `no-store`.
 - Cookie `HttpOnly + SameSite=Lax`: not readable by JS, not sent on cross-site requests.
 - The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-oauth/login` and `/dsh-webui-oauth/setup` (the latter protected by the setup token).
-- **OIDC SSO**: authorization-code + PKCE + client_secret (confidential client, no public-client PKCE); state guards CSRF, nonce guards replay, redirect_uri is exact-matched (base + fixed path), id_token is JWKS-verified with iss/aud/exp/iat/nbf/nonce checks, and only HTTPS endpoints are accepted. Only the `sanitizeSub`-filtered `sub` is recorded in the audit log. The OIDC client config (including the secret) is stored alongside the password credentials in `dsh-webui-auth.json` (0600 data directory).
+- **OIDC SSO**: authorization-code + PKCE + client_secret (confidential client, no public-client PKCE); state guards CSRF, nonce guards replay, redirect_uri is exact-matched (base + fixed path), id_token is JWKS-verified with iss/aud/exp/iat/nbf/nonce checks, and only HTTPS endpoints are accepted. Only the `sanitizeSub`-filtered `sub` is recorded in the audit log. The OIDC client config (including the secret) lives in `dsh-webui-oauth.json` in the data directory, kept apart from the account credentials.
 
 ## Known limits
 
