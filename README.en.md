@@ -1,8 +1,25 @@
-# dsh-webui-auth
+# dsh-webui-oauth
 
 English | [中文](README.md)
 
-A persistent WebUI authentication plugin for DeepSeek Harness. Once you create an account/password in **Settings → 身份认证 (Authentication)** or via the first-run login page, **unauthenticated browsers cannot load any WebUI resource, call any API, or open any realtime connection** — authentication is enforced at the HTTP/transport layer and cannot be bypassed through browser devtools.
+A persistent WebUI authentication plugin for DeepSeek Harness. Once you create an account/password in **Settings → 身份认证 (Authentication)** or via the first-run login page, **unauthenticated browsers cannot load any WebUI resource, call any API, or open any realtime connection** — authentication is enforced at the HTTP/transport layer and cannot be bypassed through browser devtools. Both local password accounts and **OIDC/SSO single sign-on** are supported.
+
+> **This plugin is an enhanced replacement for [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth)** (adding OIDC SSO and more). If both are installed, **this plugin disables the original at startup** (see "Relationship to the original"), so you never end up with two gates; credentials and the data directory keep the original location, so **existing accounts and sessions keep working**.
+
+## Relationship to the original (auto-displacement)
+
+The original `dsh-webui-auth` and this plugin both enforce authentication by wrapping `webServer` routes at runtime. If both gates stay alive, every request is checked twice against two independent session stores, and the two logins do not recognise each other (logging in through one gate still leaves the other returning 302/401) — the visible symptom is a login page that keeps redirecting.
+
+So at startup (before installing its own gate) this plugin walks the cordis plugin registry, finds any loaded original by plugin name, and **disposes all of its fibers**. The original is itself reversible: disposing it undoes its route wrapping and endpoint registration, after which this plugin owns the whole gate. The host log shows:
+
+```
+[dsh-webui-oauth] displaced original plugin(s): dsh-webui-auth — this plugin takes over the auth gate; credentials/data directory are shared.
+```
+
+- **Matching is by plugin name only** — no other plugin is touched; if the original is absent, startup continues silently.
+- **Data carries over seamlessly**: the data directory (`.dsh-webui-auth/`) and credentials file (`dsh-webui-auth.json`) **deliberately keep their original names**, so accounts created by the original work without migration.
+- For source / `link:` installs, if the original's directory sits next to this one and already holds credentials, this plugin reuses that data directory (only when it has none of its own).
+- Uninstalling the original and keeping only this plugin works too.
 
 ## Architecture
 
@@ -20,29 +37,34 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
 - **Cooperation with the core's own browser auth (v0.1.2-alpha.2+)**: that core version ships launch-token exchange with an origin-bound signed cookie (`dsh-auth-*`) guarding `/` and `/api`. After a successful plugin login the browser is automatically sent to the core's token-bearing root URL so the core cookie exchange runs too; `/api` requests pass through **unchanged** after the plugin session check (no more Host/Origin rewrite, which would break the core's cookie/Host binding). Both gates apply: a browser must hold the plugin session cookie **and** the core cookie.
 - **Privileged methods behind a reverse proxy / LAN (legacy cores ≤ alpha.1)**: after the session check the plugin hands authenticated requests to the core in a "loopback shape", so the core's **loopback-pinned privileged methods** (settings/credentials/agentPreset/llm.discoverModels) work in proxied deployments — the session-cookie gate is a strictly stronger identity proof than the Host-header heuristic it replaces.
 - **WebSocket and `trustedHosts`**: the WS upgrade handshake still goes through the core's own `requestRejection` / `isTrustedApiRequest`, so **in reverse-proxy / LAN deployments (non-loopback Host) you must also add the public hostname to `client-connection.trustedHosts` in the DSH config**, otherwise even authenticated upgrades are rejected.
+- **Optional OIDC SSO (0.4.0)**: standards-based authorization-code + PKCE with a **confidential client (client_secret required)**, security-benchmarked against Logto. Once configured, the login page shows an "SSO single sign-on" button; after IdP authentication the plugin creates a local session keyed by the IdP `sub` (reusing the session TTL and persistence). The **redirect_uri base is set by `oidc.redirectBase`**; by default `trustBrowserOrigin: true` lets the browser decide (it trusts the front-end `location.origin` — under a host-rewriting reverse proxy the browser's public address is correct), and when disabled only the configured `redirectBase` is used; if neither is available it fails closed with an error. Supports RSA/EC/EdDSA-signed id_token validation (JWKS + iss/aud/exp/iat/nbf/nonce checks) and simple local logout (clears the local session only, no IdP SLO).
 - **Scheme-adaptive post-login redirect (0.3.3, fixes #6 / #7)**: after a successful login the plugin sends the browser to the core's token-bearing root URL. Its **authority now comes from the request Host** (no longer hardcoded to `127.0.0.1`) and its **scheme follows the protocol the request actually used**, resolved in this order: ① the operator's explicit `remote-web-ui.publicBaseUrl` (**trusted only when its host/port matches the incoming Host** — otherwise a LAN direct hit would be redirected to the public address and lose the freshly issued session cookie to a cross-origin hop); ② the standard proxies headers `X-Forwarded-Proto` (leftmost value) or RFC 7239 `Forwarded: proto=`; ③ a TLS-terminating socket (`socket.encrypted`); ④ fallback `http`. It deliberately does **not** guess "non-IP hostname ⇒ https", which would turn plain-http intranet access (`http://nas.local:3080`) into a dead https link. The login page adds a one-way client-side fallback: an https page receiving a **same-origin** `http://` redirect upgrades it to `https://` (never downgrades, never rewrites another origin).
 
 Sessions are **server-side and persisted to disk** (`sessions.jsonl`, survive a DSH restart, expire server-side), carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
 
 ## Installation
 
-This plugin is a standard **bundle**, published on npm — the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback. Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
+This plugin is a standard **bundle** — the official `dsh plugin` command is the recommended way to install it. The manual method is kept as a fallback. Prerequisite: pnpm on the machine (Node ships corepack — run `corepack enable pnpm` to activate it).
 
-### Method 1: npm install (recommended)
-
-```sh
-npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
-```
-
-Pulls the prebuilt package from the npm registry (plain JS — no prepare script, no build authorization), adds the dependency and appends it to the `dsh.profile.bundles` list; the plugin row is inserted automatically via the bundle layer.
-
-### Method 2: GitHub install
+### Method 1: GitHub install (recommended)
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add github:WU-HINS/dsh-webui-oauth
 ```
 
-Fetches the repository source (works directly — no build step either). Prefer Method 1 when the network to GitHub is unreliable.
+Fetches the repository source (plain JS — works directly, no build step).
+
+> If you previously installed the original `github:Yuuz12/dsh-webui-auth`, you can switch straight to this repository — the plugin displaces the original automatically and reuses the same data directory, so no account needs to be recreated.
+
+### Method 2: npm install
+
+> Requires the package to be published on the npm registry. If `dsh-webui-oauth` is not published yet, use Method 1.
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
+```
+
+Pulls the package from the npm registry, adds the dependency and appends it to the `dsh.profile.bundles` list; the plugin row is inserted automatically via the bundle layer.
 
 ### Method 3: manual (fallback)
 
@@ -50,31 +72,31 @@ Fetches the repository source (works directly — no build step either). Prefer 
 2. Add one row to the `insert` list in `profiles/web/cordis.patch.yml`:
 
 ```yaml
-    - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+    - id: dsh-webui-oauth
+      name: 'dsh-webui-oauth'
 ```
 
-> Maintainer dev mode: `dsh plugin --profile web add ./dsh-webui-auth` from a local source checkout (`link:` install) — edit code, restart DSH, done; no reinstall needed.
+> Maintainer dev mode: `dsh plugin --profile web add ./dsh-webui-oauth` from a local source checkout (`link:` install) — edit code, restart DSH, done; no reinstall needed.
 
 ### Common to all methods
 
-**No core-package patches are needed** (no `[dsh-webui-auth patch]` markers, no `node_modules` edits) — just restart DSH. On startup the host log prints `[dsh-webui-auth] started, credentials file: ...`; if the route wrapping is incomplete it prints `ROUTE GATE INCOMPLETE` and authentication cannot be enabled (fail-closed).
+**No core-package patches are needed** (no `[dsh-webui-auth patch]` markers, no `node_modules` edits) — just restart DSH. On startup the host log prints `[dsh-webui-oauth] started, credentials file: ...`; if the route wrapping is incomplete it prints `ROUTE GATE INCOMPLETE` and authentication cannot be enabled (fail-closed).
 
 ## Uninstallation
 
 ### Method 1: `dsh plugin` command (for method-1 installs)
 
-1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth` (removes both the dependency and the bundle layer)
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-oauth` (removes both the dependency and the bundle layer)
 2. Restart DSH
 
 ### Method 2: manual (for method-2 installs)
 
-1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-auth/` (since 0.3.1 runtime data lives outside the package, deleting it does not touch the account; to wipe the account too, also delete the `.dsh-webui-auth/` data directory — see "Data file locations")
+1. **Delete the plugin directory** `profiles/web/node_modules/dsh-webui-oauth/` (since 0.3.1 runtime data lives outside the package, deleting it does not touch the account; to wipe the account too, also delete the `.dsh-webui-auth/` data directory — see "Data file locations")
 2. **Remove the mount row** from `profiles/web/cordis.patch.yml`:
 
 ```yaml
-    - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+    - id: dsh-webui-oauth
+      name: 'dsh-webui-oauth'
 ```
 
    This step is required — otherwise the loader fails at startup because the package is missing.
@@ -84,7 +106,7 @@ With either method, after the restart authentication is fully disabled (**no cor
 
 ## Usage
 
-- **First enable (setup token required)**: while no credentials exist, authentication is off (all requests pass), but creating the administrator account requires a **per-boot setup token** — open WebUI → Settings → 身份认证 (Authentication), or visit `/dsh-webui-auth/login`, enter the token printed in the startup log as `[dsh-webui-auth] setup token (...)` (or read the `setup-token` file in the data directory, mode 0600), then create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character). The token is regenerated on every boot and deleted once setup succeeds, preventing someone from claiming the administrator account in the "exposed before configured" window.
+- **First enable (setup token required)**: while no credentials exist, authentication is off (all requests pass), but creating the administrator account requires a **per-boot setup token** — open WebUI → Settings → 身份认证 (Authentication), or visit `/dsh-webui-oauth/login`, enter the token printed in the startup log as `[dsh-webui-oauth] setup token (...)` (or read the `setup-token` file in the data directory, mode 0600), then create an account/password (≥8 characters, must include uppercase, lowercase, digit and special character). The token is regenerated on every boot and deleted once setup succeeds, preventing someone from claiming the administrator account in the "exposed before configured" window.
 - **Username rule**: 3-32 characters of letters, digits, underscore or hyphen (enforced on create/change; legacy accounts are unaffected and can still log in).
 - **Afterwards**: any unauthenticated visit to any path redirects to the login page; after login you stay signed in for the chosen **session lifetime** (browser session / 1 hour / 12 hours (default) / 1 day / 3 days), enforced server-side by expiry. **Sessions are persisted to disk — after a DSH restart logged-in devices stay signed in** (the expiry still applies). "Browser session" mode: the 30-minute window slides with activity, and closing the browser logs you out.
 - **Change / disable / log out**: Settings → 身份认证 (all require the current password); changing the password revokes every other logged-in session.
@@ -95,7 +117,7 @@ With either method, after the restart authentication is fully disabled (**no cor
 Credentials and security data are stored in the **runtime data directory**, chosen automatically by install mode:
 
 - **npm / GitHub / tarball installs**: the package lives inside `node_modules`, which is wholesale replaced on upgrade, reinstall or cleanup — so data is stored in a `.dsh-webui-auth/` directory **next to that `node_modules`** (usually the profile root, e.g. `~/.dsh/profiles/web/.dsh-webui-auth/`). Upgrading the plugin, `pnpm clean`, or reinstalling DSH no longer loses the account or login sessions.
-- **Local link / source installs** (`dsh plugin add ./dsh-webui-auth`): the plugin source directory itself (managed with the repo and excluded from git via `.gitignore`; deleting the whole source checkout is what deletes the data).
+- **Local link / source installs** (`dsh plugin add ./dsh-webui-oauth`): the plugin source directory itself (managed with the repo and excluded from git via `.gitignore`; deleting the whole source checkout is what deletes the data).
 - **Fallback**: when none of the above is writable, `$DSH_HOME/dsh-webui-auth/` (default `~/.dsh/dsh-webui-auth/`) is used.
 
 Upgrading from 0.3.x: runtime data is **not migrated automatically**. If the legacy data (inside the package directory or `~/.dsh/dsh-webui-auth/`) still exists, copy `dsh-webui-auth.json`, `sessions.jsonl`, `audit-hmac-key` and `audit.jsonl` from the table below into the new data directory manually (for npm / GitHub / tarball installs that is `.dsh-webui-auth/` next to `node_modules`); otherwise just recreate the account with a fresh setup token (see "Forgot password").
@@ -143,7 +165,8 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 - Persisted sessions: `sessions.jsonl` (0600), restored on restart; a write failure never affects authentication — the settings page just warns that a restart will require re-login.
 - Security headers on the login page and API responses: strict CSP, `nosniff`, `DENY` framing, `no-referrer`, `noindex`, `no-store`.
 - Cookie `HttpOnly + SameSite=Lax`: not readable by JS, not sent on cross-site requests.
-- The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-auth/login` and `/dsh-webui-auth/setup` (the latter protected by the setup token).
+- The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-oauth/login` and `/dsh-webui-oauth/setup` (the latter protected by the setup token).
+- **OIDC SSO**: authorization-code + PKCE + client_secret (confidential client, no public-client PKCE); state guards CSRF, nonce guards replay, redirect_uri is exact-matched (base + fixed path), id_token is JWKS-verified with iss/aud/exp/iat/nbf/nonce checks, and only HTTPS endpoints are accepted. Only the `sanitizeSub`-filtered `sub` is recorded in the audit log. The OIDC client config (including the secret) is stored alongside the password credentials in `dsh-webui-auth.json` (0600 data directory).
 
 ## Known limits
 

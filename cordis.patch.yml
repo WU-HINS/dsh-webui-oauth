@@ -1,4 +1,6 @@
-# dsh-webui-auth 组合包层：安装本 bundle 时插入插件行
+# dsh-webui-oauth 组合包层：安装本 bundle 时插入插件行
+# 注意：id 与包名一致；本插件会主动让原版 dsh-webui-auth 失效（见 index.js 的
+# "顶掉原版" 逻辑），因此两者同时安装时不会出现双闸门。
 - insert:
-    - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+    - id: dsh-webui-oauth
+      name: 'dsh-webui-oauth'

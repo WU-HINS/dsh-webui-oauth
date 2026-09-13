@@ -29,6 +29,71 @@
  *       raw addresses (the HMAC key is generated once and stored next to
  *       the credentials with 0600 permissions).
  *
+ * 0.4.0 — optional OIDC single sign-on (SSO):
+ *
+ *   O1. Standards-based OIDC authorization-code flow with PKCE (S256) plus a
+ *       confidential client (client_secret required; public-client PKCE-only
+ *       mode is deliberately unsupported). The IdP is discovered through
+ *       {issuer}/.well-known/openid-configuration; only HTTPS endpoints are
+ *       accepted.
+ *   O2. The login page grows an "SSO" button next to the password form; both
+ *       methods coexist. After the IdP round-trip the plugin mints the SAME
+ *       local session as a password login (server-side session, persisted
+ *       sessions.jsonl, identical TTL), keyed by the IdP `sub`. The final
+ *       redirect reuses postLoginRedirect() so the core's launch-token
+ *       exchange still runs.
+ *   O3. redirect_uri base resolution (this is the part that decides where the
+ *       IdP sends the browser back):
+ *         - `oidc.redirectBase` configured  → use it;
+ *         - otherwise `trustBrowserOrigin` (default true) trusts the
+ *           front-end `location.origin` reported by the login page — under a
+ *           reverse proxy that rewrites Host the browser's own address is the
+ *           correct one;
+ *         - `trustBrowserOrigin: false` → only `redirectBase` is used, and if
+ *           it is absent the request fails closed with a clear error instead
+ *           of guessing.
+ *       The redirect_uri is always `<base> + /dsh-webui-oauth/oidc/callback`
+ *       (fixed path), and isValidOrigin() only accepts a bare http(s) origin
+ *       with no path/query/hash/userinfo and no control characters — which
+ *       also kills CRLF-injection attempts before URL parsing can silently
+ *       strip them.
+ *   O4. id_token validation: JWKS lookup by kid (falling back to the alg
+ *       family), signature verification for RS256/384/512, ES256/384/512 and
+ *       EdDSA, then iss / aud / exp / iat / nbf / nonce checks. ECDSA
+ *       signatures are JOSE raw R||S (ieee-p1363), not DER.
+ *   O5. state (CSRF), nonce (replay) and the PKCE verifier are single-use,
+ *       kept in memory with a 10-minute TTL and consumed on callback. The state
+ *       is ALSO bound to the browser through a short-lived HttpOnly cookie and
+ *       both must match on callback — checking only "state exists server-side"
+ *       would still allow an attacker to take a state and have the victim
+ *       complete the callback (session fixation / login CSRF). Only the
+ *       sanitizeSub()-filtered `sub` reaches the audit log, so a hostile IdP
+ *       cannot inject into log lines. Logout is the simple variant: the local
+ *       session is cleared; the IdP session is left alone.
+ *       The session identity uses the RAW sub, not the sanitized one:
+ *       sanitization is lossy ('a/b' and 'a_b' collapse to the same string),
+ *       so using it as identity would conflate two distinct IdP subjects.
+ *   O6. Config lives in the plugin's own credential file (v4 adds an `oidc`
+ *       object next to username/hash/ttl), so the secret sits in the same
+ *       0600 data directory as the password hash. Zero new dependencies:
+ *       Node 22's built-in fetch/crypto do discovery, token exchange and JWT
+ *       verification.
+ *   O7. Hardening found during self-review (each had a regression test added):
+ *       - Discovery/JWKS fetches use redirect:'error' and the jwks_uri must be
+ *         same-origin with the issuer; otherwise one discovery response could
+ *         point the trust anchor at an arbitrary host.
+ *       - findJwk validates that the token's alg matches the JWK's key type
+ *         (algMatchesKty) before use, and rejects alg=none/HS* outright —
+ *         without this the token's own header would choose the verify
+ *         algorithm (classic algorithm-confusion).
+ *       - Multi-valued `aud` additionally requires azp === clientId per OIDC.
+ *       - makeDiscoveryCache returns the SAME shape on a cache hit as on a
+ *         miss. It used to return its internal record ({ts,meta,jwks}) while
+ *         callers read {ok,metadata}, so every login after the first one
+ *         within the 1h window was misreported as "discovery failed".
+ *       - sendJson accepts optional extra response headers; without it the
+ *         state-cookie-clearing Set-Cookie was silently dropped.
+ *
  * 0.3.3 — post-login redirect scheme (fixes #6 / #7):
  *
  *   C4. postLoginRedirect() no longer hardcodes "http://". The scheme is now
@@ -73,13 +138,13 @@
  * other session.
  */
 
-import { randomBytes, scrypt as scryptCb, timingSafeEqual, createHmac } from "node:crypto";
+import { randomBytes, scrypt as scryptCb, timingSafeEqual, createHmac, createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unlinkSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
 
-export const name = 'dsh-webui-auth'
+export const name = 'dsh-webui-oauth'
 
 export const inject = ['webServer', 'fs']
 
@@ -170,6 +235,9 @@ function resolveDataDirFrom(dir) {
   // .../node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>，只有最外层 node_modules
   // 的上级（通常是 profile 根）才是稳定位置。link/源码安装时 Node 已把 import.meta.url
   // 解析为真实路径，不含 node_modules 段，走原有逻辑（数据在源码目录，随仓库管理）。
+  //
+  // 注意：数据目录名沿用原版的 `.dsh-webui-auth`（**刻意不改**）。本插件是原版
+  // dsh-webui-auth 的替代品，用户很可能已有账号与登录会话；换名会导致"装上就丢账号"。
   if (dir) {
     const norm = dir.replace(/\\/g, '/')
     const cut = norm.indexOf('/node_modules/')
@@ -192,8 +260,38 @@ function resolveDataDirFrom(dir) {
   return legacyHomeDir()
 }
 
+/**
+ * 源码 / link 安装下，数据就在插件源码目录内。改包名后（dsh-webui-auth →
+ * dsh-webui-oauth）目录名变了，直接取自身目录会看不到原版留下的账号。
+ * 这里检查【同级】是否存在原版目录且含凭据；有则优先复用它，实现无缝接管。
+ * 仅在自身目录尚无凭据时才复用，避免覆盖本插件已经产生的数据。
+ */
+function adoptSiblingDataDir(selfDir) {
+  if (!selfDir) return selfDir
+  try {
+    const norm = selfDir.replace(/\\/g, '/')
+    const slash = norm.lastIndexOf('/')
+    if (slash <= 0) return selfDir
+    const parent = norm.slice(0, slash)
+    const base = norm.slice(slash + 1)
+    if (!base.startsWith('dsh-webui-')) return selfDir
+    const ownCred = selfDir + '/dsh-webui-auth.json'
+    let ownHasCred = true
+    try { accessSync(ownCred, fsConstants.R_OK) } catch (e) { ownHasCred = false }
+    if (ownHasCred) return selfDir // 自己已有数据：不动
+    const sibling = parent + '/dsh-webui-auth'
+    if (sibling === norm) return selfDir
+    try {
+      accessSync(sibling + '/dsh-webui-auth.json', fsConstants.R_OK)
+      return sibling
+    } catch (e) { return selfDir }
+  } catch (e) {
+    return selfDir
+  }
+}
+
 const MODULE_DIR = pluginDir()
-const DATA_DIR = resolveDataDirFrom(MODULE_DIR)
+const DATA_DIR = resolveDataDirFrom(adoptSiblingDataDir(MODULE_DIR))
 
 function configPath() {
   return DATA_DIR + '/dsh-webui-auth.json'
@@ -336,7 +434,7 @@ async function auditLog(ctx, event, fields) {
     appendFileSync(target, JSON.stringify(entry) + '\n', 'utf8')
   } catch (e) {
     try {
-      ctx.logger.warn('[dsh-webui-auth] audit write failed: ' + (e && e.message ? e.message : String(e)))
+      ctx.logger.warn('[dsh-webui-oauth] audit write failed: ' + (e && e.message ? e.message : String(e)))
     } catch (err) { /* ignore */ }
   }
 }
@@ -403,13 +501,17 @@ function passwordStrength(p) {
 
 // ---------------- HTTP 工具 ----------------
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, extraHeaders) {
   const text = JSON.stringify(body)
-  res.writeHead(status, {
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
     'x-content-type-options': 'nosniff',
     'cache-control': 'no-store',
-  })
+  }
+  if (extraHeaders && typeof extraHeaders === 'object') {
+    for (const k of Object.keys(extraHeaders)) headers[k] = extraHeaders[k]
+  }
+  res.writeHead(status, headers)
   res.end(text)
 }
 
@@ -458,6 +560,8 @@ function safeTokenEquals(supplied, expected) {
 // ---------------- 会话管理（H3：持久化到磁盘） ----------------
 
 const COOKIE_NAME = 'dsh_wua_session'
+// OIDC 登录 CSRF 绑定 Cookie：与 state 同值，回调时必须一致。
+const COOKIE_OIDC_STATE = 'dsh_wua_oidc_state'
 
 function sessionCookie(token, maxAgeSeconds) {
   let c = COOKIE_NAME + '=' + token + '; HttpOnly; SameSite=Lax; Path=/'
@@ -612,6 +716,11 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     color: var(--dsw-alias-label-primary, #222); background: var(--dsw-alias-bg-layer-1, #fff);
     border: 1px solid var(--dsw-alias-border-l2, #999); border-radius: 4px; }
   button:disabled { opacity: .55; cursor: default; }
+  .sso-row { display: none; margin-top: 12px; }
+  .sso-btn { margin-top: 0; }
+  .sso-sep { margin: 16px 0 0; text-align: center; font-size: 12px; color: var(--dsw-alias-label-secondary, #888); }
+  .sso-sep::before, .sso-sep::after { content: ''; display: inline-block; width: 36px; height: 1px;
+    background: var(--dsw-alias-border-l2, #ccc); vertical-align: middle; margin: 0 10px; }
   .err { display: none; margin: 10px 0 0; font-size: 12px; color: var(--dsw-alias-state-error-primary, #d1242f); }
   .hint { margin: 14px 0 0; font-size: 12px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #888);
     border-top: 1px solid var(--dsw-alias-border-l1, #e5e5e5); padding-top: 10px; }
@@ -655,14 +764,20 @@ const LOGIN_PAGE = `<!DOCTYPE html>
     </div>
     <button id="b" type="submit">登录</button>
     <p class="err" id="e"></p>
+    <div class="sso-row" id="ssorow">
+      <p class="sso-sep">或</p>
+      <button class="sso-btn" id="sso" type="button">使用 SSO 单点登录</button>
+    </div>
   </form>
   <p class="hint">忘记密码：删除插件数据目录的 dsh-webui-auth.json 文件即可重置。</p>
 </div>
 <script>
 var MODE = "__MODE__";
+var OIDC_ENABLED = "__OIDC_ENABLED__";
 var sub = document.getElementById('sub'), pl = document.getElementById('pl'), pc = document.getElementById('pc'), e = document.getElementById('e'),
   u = document.getElementById('u'), p = document.getElementById('p'), p2 = document.getElementById('p2'), b = document.getElementById('b'),
-  f = document.getElementById('f'), t = document.getElementById('t'), tokenrow = document.getElementById('tokenrow');
+  f = document.getElementById('f'), t = document.getElementById('t'), tokenrow = document.getElementById('tokenrow'),
+  ssorow = document.getElementById('ssorow'), sso = document.getElementById('sso');
 function show(msg) { e.textContent = msg; e.style.display = 'block'; }
 if (MODE === 'setup') {
   sub.textContent = '首次使用：输入初始化令牌并创建管理员账号密码，之后访问 WebUI 需要登录。';
@@ -672,6 +787,18 @@ if (MODE === 'setup') {
   b.textContent = '创建账号';
 } else {
   sub.textContent = '此界面已启用身份认证，请登录后继续使用。';
+}
+// SSO 入口：仅登录模式且 OIDC 已配置时显示。跳转交给浏览器自身决定的重定向
+// （base 由 location.origin 上报；服务端 trustBrowserOrigin=true 时优先采信）。
+if (OIDC_ENABLED === 'true' && MODE === 'login') {
+  ssorow.style.display = 'block';
+}
+if (sso) {
+  sso.addEventListener('click', function () {
+    var base = location.origin || '';
+    var target = '/dsh-webui-oauth/oidc/login' + (base ? '?base=' + encodeURIComponent(base) : '');
+    location.href = target;
+  });
 }
 function validUsername(name) { return /^[A-Za-z0-9_-]{3,32}$/.test(name); }
 function goTo(target) {
@@ -690,7 +817,7 @@ f.addEventListener('submit', function (ev) {
   ev.preventDefault();
   var username = u.value.trim(), password = p.value, token = t ? t.value.trim() : '';
   if (MODE === 'setup') {
-    if (!token) return show('请输入初始化令牌（dsh 启动日志中查找 [dsh-webui-auth] setup token）');
+    if (!token) return show('请输入初始化令牌（dsh 启动日志中查找 [dsh-webui-oauth] setup token）');
     if (!validUsername(username)) return show('用户名需为 3-32 位字母、数字、下划线或连字符');
     if (password.length < 8) return show('密码至少需要 8 位');
     if (!/[a-z]/.test(password)) return show('密码必须包含小写字母');
@@ -702,7 +829,7 @@ f.addEventListener('submit', function (ev) {
   b.disabled = true; b.textContent = '请稍候…';
   var body = { username: username, password: password };
   if (MODE === 'setup') body.token = token;
-  fetch(MODE === 'setup' ? '/dsh-webui-auth/setup' : '/dsh-webui-auth/login', {
+  fetch(MODE === 'setup' ? '/dsh-webui-oauth/setup' : '/dsh-webui-oauth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   }).then(function (r) { return r.json(); }).then(function (r) {
     if (r && r.ok) { goTo(r.redirect); return; }
@@ -744,6 +871,56 @@ function rejectUpgrade401(socket) {
     socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 13\r\n\r\nunauthorized\n')
   } catch (e) { /* ignore */ }
   try { socket.destroy() } catch (e) { /* ignore */ }
+}
+
+// ---------------- 顶掉原版 dsh-webui-auth ----------------
+//
+// 本插件（dsh-webui-oauth）是原版 dsh-webui-auth 的增强替代。两者都通过运行时包装
+// webServer 路由实现认证：同时加载会出现【双闸门】——同一请求被两套会话校验各拦一次，
+// 且两套 /dsh-webui-* 端点并存，登录态互不相认（在一个闸门登录，另一个仍返回 302/401），
+// 表现为「登录后反复跳转」。
+//
+// 因此这里主动停掉已加载的原版：遍历 cordis 插件注册表，按插件名找到原版 runtime，
+// 逐个 dispose 它的 fiber。卸掉后原版的 ctx.effect 清理函数会执行，其路由包装与
+// 端点注册被完整撤销（原版自身就是可逆设计），随后由本插件接管全部闸门。
+//
+// 边界：只按【插件名】匹配，不碰任何其他插件；找不到原版时静默继续（正常路径）。
+const DISPLACED_PLUGIN_NAMES = ['dsh-webui-auth']
+
+function displaceOriginalPlugins(ctx, log) {
+  const displaced = []
+  try {
+    const registry = ctx.registry
+    if (!registry || typeof registry.values !== 'function') return displaced
+    // 先收集再 dispose：遍历过程中直接删除会破坏迭代。
+    const victims = []
+    for (const runtime of registry.values()) {
+      const rtName = runtime && runtime.name
+      if (typeof rtName === 'string' && DISPLACED_PLUGIN_NAMES.includes(rtName)) {
+        victims.push(runtime)
+      }
+    }
+    for (const runtime of victims) {
+      // registry.delete(callback) 会 dispose 该插件的全部 fiber；
+      // 用 runtime.callback 作为 key（这正是 map 的键）。
+      const removed = typeof registry.delete === 'function' ? registry.delete(runtime.callback) : undefined
+      const fibers = (removed && removed.fibers) || runtime.fibers
+      // 双保险：即使 registry.delete 未生效，也逐个 dispose 掉 fiber。
+      if (fibers && typeof fibers[Symbol.iterator] === 'function') {
+        for (const fiber of fibers) {
+          try {
+            if (fiber && typeof fiber.dispose === 'function') fiber.dispose()
+          } catch (e) { /* 单个 fiber 清理失败不应阻断接管 */ }
+        }
+      }
+      displaced.push(runtime.name)
+    }
+  } catch (e) {
+    // 注册表结构变化时不能让接管流程崩溃：退化为「不做替换」，
+    // 由调用方记录警告，运维可从日志发现双装。
+    try { log('displace failed: ' + (e && e.message ? e.message : String(e))) } catch (err) { /* ignore */ }
+  }
+  return displaced
 }
 
 /**
@@ -1012,7 +1189,319 @@ function postLoginRedirect(ctx, req) {
   }
 }
 
+// ================= OIDC SSO（可选，Logto 为安全基准） =================
+//
+// 认证模式：authorization_code + PKCE，机密客户端（必须 client_secret）。
+// 依据部署者决策：trustBrowserOrigin 默认 true = 交给浏览器自行处理重定向；
+// 关闭时仅用 redirectBase。redirectBase 是反代重写 host/origin 时的确定性答案。
+//
+// 安全要点：
+//   - redirect_uri = base + 固定路径 '/dsh-webui-oauth/oidc/callback'，不允许改路径。
+//   - state 防 CSRF、nonce 防重放、PKCE S256 防授权码拦截（配合 secret 双重防护）。
+//   - id_token 验证：JWKS(RS256) 验签 + iss/aud/exp/iat/nbf/nonce。
+//   - 端点仅接受 HTTPS（issuer 必须 https，回调同源由浏览器/配置决定）。
+//   - 审计只记录 sanitizeSub() 过滤后的 subject，杜绝注入。
+
+const OIDC_CALLBACK_PATH = '/dsh-webui-oauth/oidc/callback'
+const OIDC_STATE_TTL_MS = 10 * 60 * 1000
+
+// 纯 origin 格式校验：http/https、无 path/query/hash、无 userinfo。
+// 刻意**不做** host 匹配——trustBrowserOrigin 语义即"信前端 origin"，
+// 这里只挡"明显构造的垃圾值/注入"，保底格式合法性。
+export function isValidOrigin(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return false
+  // 拒绝控制字符（\r \n \t 等）：WHATWG URL 解析器会静默剥离 CRLF 产生看似合法的畸形 URL，
+  // 这里在解析前显式拦截，杜绝 CRLF/控制字符注入。
+  if (/[\x00-\x1f\x7f]/.test(raw)) return false
+  let url
+  try {
+    url = new URL(raw)
+  } catch (e) {
+    return false
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+  if (url.pathname !== '/' && url.pathname !== '') return false
+  if (url.search !== '' || url.hash !== '') return false
+  if (url.username !== '' || url.password !== '') return false
+  return true
+}
+
+// 决定 OIDC 回调的 base origin。
+//   trustBrowserOrigin=true  → 前端 origin 优先，缺失/非法回退 redirectBase；
+//   trustBrowserOrigin=false → 仅 redirectBase；
+//   两者都不可用 → null（调用方 fail-closed 报错）。
+export function resolveOidcBase(oidc, frontendOrigin) {
+  const trust = !oidc || oidc.trustBrowserOrigin !== false
+  const configBase = oidc && typeof oidc.redirectBase === 'string' ? oidc.redirectBase : null
+  if (trust) {
+    if (isValidOrigin(frontendOrigin)) return frontendOrigin
+    if (isValidOrigin(configBase)) return configBase
+    return null
+  }
+  if (isValidOrigin(configBase)) return configBase
+  return null
+}
+
+// OIDC subject 字符集白名单：OIDC sub 理论是任意字符串，不能直接拼进审计/日志。
+// 保留字母数字与常见分隔符，其余转义。返回永不包含换行/引号注入的字符串。
+export function sanitizeSub(raw) {
+  if (typeof raw !== 'string') return 'unknown'
+  const s = raw.replace(/[^\w.\-:/@+]/g, '_').slice(0, 128)
+  return s.length ? s : 'unknown'
+}
+
+// 一次性随机值（state / nonce / PKCE verifier）。base64url，长度 >= 24 字节熵。
+export function oidcRandom(byteLen = 24) {
+  return Buffer.from(randomBytes(byteLen)).toString('base64url')
+}
+
+function oidcChallenge(verifier) {
+  return createHash('sha256').update(verifier).digest('base64url')
+}
+
+// 安全的 base64url 解码（容忍缺 padding）。
+function b64urlDecode(s) {
+  let b = String(s).replace(/-/g, '+').replace(/_/g, '/')
+  while (b.length % 4) b += '='
+  const buf = Buffer.from(b, 'base64')
+  if (buf.length === 0 && s) throw new Error('bad base64url')
+  return buf
+}
+
+// 解析 JWT 三段。返回 { header, payload, sig }，均 base64url 原文。
+export function parseJwt(jwt) {
+  if (typeof jwt !== 'string') return null
+  const parts = jwt.split('.')
+  if (parts.length !== 3) return null
+  let header = null
+  let payload = null
+  try {
+    header = JSON.parse(b64urlDecode(parts[0]).toString('utf8'))
+    payload = JSON.parse(b64urlDecode(parts[1]).toString('utf8'))
+  } catch (e) {
+    return null
+  }
+  if (!header || typeof header !== 'object' || !payload || typeof payload !== 'object') return null
+  return { header, payload, sig: parts[2] }
+}
+
+// 用 JWK 验签：支持 RS256/384/512、ES256/384/512、EdDSA。
+// jwk 来自 JWKS（kid 已由调用方挑选）。
+// 注意：crypto.verify 的第一个参数是哈希算法名（'sha256'）不是 JWT alg（'RS256'），
+// 且它不接收裸 JWK 对象——须用 createPublicKey({key, format:'jwk'}) 转 KeyObject；
+// ECDSA JWT 签名是 JOSE 原始 R||S（ieee-p1363），非 DER，须指定 dsaEncoding。
+function jwtAlgToDigest(alg) {
+  const m = {
+    RS256: 'sha256', RS384: 'sha384', RS512: 'sha512',
+    ES256: 'sha256', ES384: 'sha384', ES512: 'sha512',
+    PS256: 'sha256', PS384: 'sha384', PS512: 'sha512',
+  }
+  return m[alg] || null
+}
+export function verifyJwtSignature(jwt, jwk) {
+  try {
+    const parts = jwt.split('.')
+    if (parts.length !== 3) return false
+    const data = Buffer.from(parts[0] + '.' + parts[1], 'utf8')
+    const sig = b64urlDecode(parts[2])
+    const header = parseJwt(jwt) && parseJwt(jwt).header
+    const alg = (jwk && jwk.alg) || (header && header.alg)
+    if (!alg) return false
+    let jwkKey = jwk
+    if (jwk && jwk.kty === 'EC') {
+      jwkKey = { kty: 'EC', crv: jwk.crv, x: jwk.x, y: jwk.y }
+    } else if (jwk && jwk.kty === 'OKP') {
+      jwkKey = { kty: 'OKP', crv: jwk.crv, x: jwk.x }
+    } else if (jwk && jwk.kty === 'RSA') {
+      jwkKey = { kty: 'RSA', n: jwk.n, e: jwk.e }
+    }
+    const key = createPublicKey({ key: jwkKey, format: 'jwk' })
+    if (alg === 'EdDSA') {
+      return cryptoVerify(null, data, key, sig)
+    }
+    const digest = jwtAlgToDigest(alg)
+    if (!digest) return false
+    // ECDSA JWT 签名采用 JOSE/ieee-p1363 原始 R||S 格式，而 crypto.verify 默认期望 DER——
+    // 须显式指定 dsaEncoding，否则 ES384/ES512 会验签失败（ES256 因曲线小偶尔误中）。
+    if (alg.startsWith('ES')) {
+      return cryptoVerify(digest, data, { key, dsaEncoding: 'ieee-p1363' }, sig)
+    }
+    return cryptoVerify(digest, data, key, sig)
+  } catch (e) {
+    return false
+  }
+}
+
+// 从 JWKS 中按 kid 选 key；无 kid 时取首枚算法匹配的 key。
+// 命中 kid 后仍校验 alg 与 key 类型一致：攻击者可用 RSA key 的 kid 配 ES256 头，
+// 若直接采信会把"该用哪种算法验签"的决定权交给 token 本身（算法混淆的温床）。
+function algMatchesKty(alg, kty) {
+  if (alg === 'EdDSA') return kty === 'OKP'
+  if (alg.startsWith('RS') || alg.startsWith('PS')) return kty === 'RSA'
+  if (alg.startsWith('ES')) return kty === 'EC'
+  return false
+}
+export function findJwk(jwks, header) {
+  if (!jwks || !Array.isArray(jwks.keys) || !header) return null
+  const alg = typeof header.alg === 'string' ? header.alg : ''
+  if (!alg) return null // 无 alg 一律拒绝，不做猜测
+  const usable = (k) => !!k && typeof k === 'object' && algMatchesKty(alg, k.kty)
+  if (header.kid) {
+    const hit = jwks.keys.find((k) => usable(k) && k.kid === header.kid)
+    if (hit) return hit
+    return null // 指定了 kid 却无匹配（或类型不符）：不再退化为"随便挑一把"
+  }
+  if (alg.startsWith('RS') || alg.startsWith('PS')) {
+    return jwks.keys.find((k) => usable(k)) || null
+  }
+  if (alg.startsWith('ES')) {
+    return jwks.keys.find((k) => usable(k)) || null
+  }
+  if (alg === 'EdDSA') {
+    return jwks.keys.find((k) => usable(k)) || null
+  }
+  return null
+}
+
+// 验证 id_token 的声明与签名。返回 { ok, error, payload }。
+// opts: { issuer, clientId, nonce, jwks, now? }
+export function validateIdToken(idToken, opts) {
+  const parsed = parseJwt(idToken)
+  if (!parsed) return { ok: false, error: 'malformed-jwt', payload: null }
+  const { header, payload } = parsed
+  const now = opts.now || Date.now()
+
+  const iss = payload.iss
+  if (typeof iss !== 'string' || iss !== opts.issuer) return { ok: false, error: 'bad-iss', payload }
+  // aud 校验：只接受字符串或字符串数组（杜绝 null/数字的类型混淆），
+  // 且多值 aud 时按 RFC/OIDC 必须同时校验 azp —— 否则一个针对多个 client
+  // 签发的 token 可被我们误认为"发给自己"。
+  const aud = payload.aud
+  let audOk = false
+  if (typeof aud === 'string') {
+    audOk = aud === opts.clientId
+  } else if (Array.isArray(aud) && aud.every((a) => typeof a === 'string')) {
+    audOk = aud.includes(opts.clientId)
+    if (audOk && aud.length > 1) {
+      if (typeof payload.azp !== 'string' || payload.azp !== opts.clientId) {
+        return { ok: false, error: 'bad-azp', payload }
+      }
+    }
+  }
+  if (!audOk) return { ok: false, error: 'bad-aud', payload }
+  if (typeof payload.exp !== 'number' || payload.exp * 1000 <= now) return { ok: false, error: 'expired', payload }
+  if (typeof payload.iat === 'number' && payload.iat * 1000 > now + 60_000) return { ok: false, error: 'future-iat', payload }
+  if (typeof payload.nbf === 'number' && payload.nbf * 1000 > now) return { ok: false, error: 'not-yet-valid', payload }
+  if (typeof opts.nonce === 'string') {
+    if (payload.nonce !== opts.nonce) return { ok: false, error: 'bad-nonce', payload }
+  }
+  if (typeof payload.sub !== 'string' || !payload.sub) return { ok: false, error: 'missing-sub', payload }
+
+  // alg 白名单：拒绝 none 与 HS*（对称算法会用公钥当前缀伪造，是经典混淆攻击）。
+  // 必须在声明校验之前判定：签名与算法合法性不通过时不得泄露任何声明校验结果。
+  const alg = header.alg
+  if (typeof alg !== 'string' || alg === 'none' || alg.startsWith('HS') || !(jwtAlgToDigest(alg) || alg === 'EdDSA')) {
+    return { ok: false, error: 'bad-alg', payload }
+  }
+
+  const jwk = findJwk(opts.jwks, header)
+  if (!jwk) return { ok: false, error: 'no-signing-key', payload }
+  if (!verifyJwtSignature(idToken, jwk)) return { ok: false, error: 'bad-signature', payload }
+
+  return { ok: true, error: null, payload }
+}
+
+// 拉取并解析 OIDC Discovery 文档（{issuer}/.well-known/openid-configuration）。
+// 仅接受 HTTPS issuer。返回 { ok, error, metadata }。
+export async function fetchOidcDiscovery(issuer, opts) {
+  try {
+    if (typeof issuer !== 'string' || !issuer.trim()) return { ok: false, error: 'bad-issuer', metadata: null }
+    const issuerUrl = new URL(issuer.trim())
+    if (issuerUrl.protocol !== 'https:') return { ok: false, error: 'issuer-not-https', metadata: null }
+    // RFC 8414 / OIDC Discovery：issuer 路径拼接 .well-known。
+    const base = issuerUrl.href.replace(/\/$/, '')
+    const url = base + '/.well-known/openid-configuration'
+    const res = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': 'dsh-webui-oauth/0.4.0' },
+      // 不跟随重定向：issuer 是部署者配置的信任锚，跟随跳转就把它交给远端决定
+      // （可被用来把 discovery 引到任意主机）。需要跳转的部署应直接配置最终 issuer。
+      redirect: 'error',
+      signal: opts && opts.signal ? opts.signal : undefined,
+    })
+    if (!res.ok) return { ok: false, error: 'discovery-http-' + res.status, metadata: null }
+    const text = await res.text()
+    let meta
+    try { meta = JSON.parse(text) } catch (e) { return { ok: false, error: 'discovery-bad-json', metadata: null } }
+    if (!meta || typeof meta !== 'object') return { ok: false, error: 'discovery-bad-shape', metadata: null }
+    if (typeof meta.issuer !== 'string' || meta.issuer.replace(/\/$/, '') !== issuerUrl.href.replace(/\/$/, '')) {
+      return { ok: false, error: 'discovery-issuer-mismatch', metadata: null }
+    }
+    for (const ep of ['authorization_endpoint', 'token_endpoint']) {
+      if (typeof meta[ep] !== 'string' || !/^https:\/\//.test(meta[ep])) {
+        return { ok: false, error: 'discovery-insecure-' + ep, metadata: null }
+      }
+    }
+    if (meta.jwks_uri !== undefined && (typeof meta.jwks_uri !== 'string' || !/^https:\/\//.test(meta.jwks_uri))) {
+      return { ok: false, error: 'discovery-insecure-jwks_uri', metadata: null }
+    }
+    return { ok: true, error: null, metadata: meta }
+  } catch (e) {
+    return { ok: false, error: 'discovery-fetch-failed', metadata: null }
+  }
+}
+
+// 拉取 JWKS 并缓存（内存 1h，失败则下次重试）。
+function makeDiscoveryCache() {
+  const cache = new Map() // issuer -> { ts, metadata, jwks }
+  async function get(issuer) {
+    const now = Date.now()
+    const hit = cache.get(issuer)
+    // 命中缓存时必须返回与未命中【完全相同的结构】({ok,error,metadata,jwks})——
+    // 曾经这里直接 return 内部记录 {ts,meta,jwks}，调用方读 disc.ok/disc.metadata
+    // 得到 undefined，于是缓存生效后的每一次登录都被误判为“Discovery 失败”。
+    if (hit && now - hit.ts < 3600_000 && hit.metadata) {
+      return { ok: true, error: null, metadata: hit.metadata, jwks: hit.jwks }
+    }
+    const r = await fetchOidcDiscovery(issuer)
+    if (!r.ok) return { ...r, jwks: null }
+    let jwks = null
+    // jwks_uri 必须与 issuer 同源：否则一次 discovery 响应就能把密钥来源指向任意主机
+    // （IdP 被攻破/配置错误时，这是把信任边界从 IdP 挪到第三方的捷径）。
+    if (r.metadata.jwks_uri) {
+      try {
+        const jwksUrl = new URL(r.metadata.jwks_uri)
+        if (jwksUrl.origin !== new URL(issuer).origin) {
+          return { ok: false, error: 'jwks-cross-origin', metadata: r.metadata, jwks: null }
+        }
+        const jres = await fetch(r.metadata.jwks_uri, { headers: { accept: 'application/json' }, redirect: 'error' })
+        if (jres.ok) {
+          const jtxt = await jres.text()
+          const parsed = JSON.parse(jtxt)
+          if (parsed && Array.isArray(parsed.keys)) jwks = parsed
+        }
+      } catch (e) { /* keep jwks null → token validation will fail cleanly */ }
+    }
+    // jwks 为空（取不到/非法）时不写缓存：否则一次瞬时故障会被钉住一小时。
+    if (jwks === null) {
+      return { ok: false, error: 'jwks-unavailable', metadata: r.metadata, jwks: null }
+    }
+    cache.set(issuer, { ts: now, metadata: r.metadata, jwks })
+    return { ok: true, error: null, metadata: r.metadata, jwks }
+  }
+  return { get }
+}
+
 export async function apply(ctx) {
+  // 顶掉原版 dsh-webui-auth（若已加载）：必须在安装本插件闸门之前完成，
+  // 否则会出现两套闸门并存的窗口。
+  const displaced = displaceOriginalPlugins(ctx, (m) => {
+    try { ctx.logger.warn('[dsh-webui-oauth] ' + m) } catch (e) { /* ignore */ }
+  })
+  if (displaced.length > 0) {
+    ctx.logger.info('[dsh-webui-oauth] displaced original plugin(s): ' + displaced.join(', ')
+      + ' — this plugin takes over the auth gate; credentials/data directory are shared.')
+  }
+
   // H1: 每次启动生成随机 setup token，仅打印到宿主日志。
   const SETUP_TOKEN = randomBytes(16).toString('hex')
 
@@ -1082,14 +1571,14 @@ export async function apply(ctx) {
   }
 
   // H2: 安装运行时路由闸门
-  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-auth] ' + m))
-  ctx.effect(() => gate.undo, 'dsh-webui-auth: route gate')
+  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-oauth] ' + m))
+  ctx.effect(() => gate.undo, 'dsh-webui-oauth: route gate')
   if (!gate.ok()) {
-    ctx.logger.error('[dsh-webui-auth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
+    ctx.logger.error('[dsh-webui-oauth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
   }
 
-  ctx.logger.info('[dsh-webui-auth] started, credentials file: ' + configPath())
+  ctx.logger.info('[dsh-webui-oauth] started, credentials file: ' + configPath())
   if (!enabledFlag) {
     // H1: token 同时落盘（0600，仅本机操作者可读），setup 成功后删除。
     // 解决 ctx.logger 输出在某些部署（systemd）下不可见的问题。
@@ -1097,30 +1586,52 @@ export async function apply(ctx) {
       ensureDataDir()
       writeFileSync(DATA_DIR + '/setup-token', SETUP_TOKEN + '\n', { mode: 0o600 })
     } catch (e) { /* 落盘失败时仍可从日志读取 */ }
-    ctx.logger.info('[dsh-webui-auth] setup token (first-run administrator creation): ' + SETUP_TOKEN)
+    ctx.logger.info('[dsh-webui-oauth] setup token (first-run administrator creation): ' + SETUP_TOKEN)
   }
 
   // 后台任务：过期会话清理 + enabled 状态刷新
   const bgTimer = setInterval(async () => {
     const now = Date.now()
     for (const [k, s] of sessions.live) if (s.expiresAt <= now) sessions.delete(k)
+    purgeExpiredOidcStates()
     try {
       const creds = await readCredentials(ctx)
       enabledFlag = isEnabled(creds)
     } catch (e) { /* keep last state */ }
   }, 60000)
-  ctx.effect(() => () => clearInterval(bgTimer), 'dsh-webui-auth: background timer')
+  ctx.effect(() => () => clearInterval(bgTimer), 'dsh-webui-oauth: background timer')
+
+  // ---------------- OIDC SSO（可选） ----------------
+
+  // 内存暂存 OIDC 授权请求状态：{ state -> { nonce, verifier, redirectUri, createdAt } }
+  // 状态一次消费即删，防 CSRF/重放；10 分钟过期，后台定时惰性清理。
+  const oidcStates = new Map()
+  const oidcDiscovery = makeDiscoveryCache()
+  function oidcOf(creds) {
+    return (creds && creds.oidc && typeof creds.oidc === 'object') ? creds.oidc : null
+  }
+  function oidcEnabled(creds) {
+    const o = oidcOf(creds)
+    return !!(o && o.enabled === true && typeof o.issuer === 'string' && typeof o.clientId === 'string' && typeof o.clientSecret === 'string')
+  }
+  function purgeExpiredOidcStates() {
+    const now = Date.now()
+    for (const [k, v] of oidcStates) if (now - v.createdAt > OIDC_STATE_TTL_MS) oidcStates.delete(k)
+  }
 
   // ---------------- 端点 ----------------
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/login',
+    path: '/dsh-webui-oauth/login',
     handler: async (req, res) => {
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
+          const credsNow = await readCredentials(ctx)
+          const oidcOn = oidcEnabled(credsNow)
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
+            .replace('__OIDC_ENABLED__', oidcOn ? 'true' : 'false')
             .replace('__THEME_PREFERENCE__', themePreference(ctx))
           res.writeHead(200, {
             'content-type': 'text/html; charset=utf-8',
@@ -1177,11 +1688,11 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: login page')
+  }), 'dsh-webui-oauth: login page')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/setup',
+    path: '/dsh-webui-oauth/setup',
     handler: async (req, res) => {
       try {
         if (req.method !== 'POST') {
@@ -1235,11 +1746,11 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: setup')
+  }), 'dsh-webui-oauth: setup')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/logout',
+    path: '/dsh-webui-oauth/logout',
     handler: async (req, res) => {
       try {
         if (req.method !== 'POST') {
@@ -1257,11 +1768,11 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: logout')
+  }), 'dsh-webui-oauth: logout')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/status',
+    path: '/dsh-webui-oauth/status',
     handler: async (req, res) => {
       try {
         if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -1274,22 +1785,24 @@ export async function apply(ctx) {
         }
         const creds = await readCredentials(ctx)
         const enabled = isEnabled(creds)
+        const oidcOn = oidcEnabled(creds)
         sendJson(res, 200, {
           enabled,
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
           gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
+          oidc: oidcOn ? { enabled: true, issuer: oidcOf(creds).issuer, clientId: oidcOf(creds).clientId, scope: oidcOf(creds).scope, redirectBase: oidcOf(creds).redirectBase, trustBrowserOrigin: oidcOf(creds).trustBrowserOrigin !== false } : { enabled: false },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: status')
+  }), 'dsh-webui-oauth: status')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/audit',
+    path: '/dsh-webui-oauth/audit',
     handler: async (req, res) => {
       try {
         if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -1311,11 +1824,11 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: audit')
+  }), 'dsh-webui-oauth: audit')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/configure',
+    path: '/dsh-webui-oauth/configure',
     handler: async (req, res) => {
       try {
         if (req.method !== 'POST') {
@@ -1377,9 +1890,43 @@ export async function apply(ctx) {
             return
           }
         }
-        const credsOut = (keepPassword && typeof creds.hash === 'string')
-          ? { v: 3, username, hash: creds.hash, ttl }
-          : { v: 3, username, hash: await hashPassword(password), ttl }
+        // OIDC 配置（可选）
+        const oidcIn = body.oidc && typeof body.oidc === 'object' ? body.oidc : null
+        if (oidcIn && typeof oidcIn.enabled === 'boolean' && typeof oidcIn.issuer === 'string' && typeof oidcIn.clientId === 'string') {
+          if (oidcIn.trustBrowserOrigin !== undefined && typeof oidcIn.trustBrowserOrigin !== 'boolean') {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：trustBrowserOrigin 须为 boolean' })
+            sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'trustBrowserOrigin 须为 boolean' })
+            return
+          }
+          if (oidcIn.clientSecret !== undefined && (typeof oidcIn.clientSecret !== 'string' || !oidcIn.clientSecret.trim())) {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：clientSecret 须为非空字符串（或留空保留旧值）' })
+            sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'clientSecret 须为非空字符串' })
+            return
+          }
+        }
+        // 合并 OIDC 配置：oidcIn 提供时整段替换（secret 留空则保留旧值）；否则关闭。
+        let oidcOut = null
+        if (oidcIn && typeof oidcIn.enabled === 'boolean' && typeof oidcIn.issuer === 'string' && typeof oidcIn.clientId === 'string') {
+          const prevSecret = (creds && creds.oidc && typeof creds.oidc.clientSecret === 'string') ? creds.oidc.clientSecret : ''
+          oidcOut = {
+            enabled: oidcIn.enabled,
+            issuer: oidcIn.issuer,
+            clientId: oidcIn.clientId,
+            clientSecret: (typeof oidcIn.clientSecret === 'string' && oidcIn.clientSecret) ? oidcIn.clientSecret : prevSecret,
+            scope: typeof oidcIn.scope === 'string' ? oidcIn.scope : undefined,
+            redirectBase: typeof oidcIn.redirectBase === 'string' && oidcIn.redirectBase.trim() ? oidcIn.redirectBase.trim() : undefined,
+            trustBrowserOrigin: oidcIn.trustBrowserOrigin !== undefined ? oidcIn.trustBrowserOrigin : true,
+          }
+        } else if (oidcIn && oidcIn.enabled === false) {
+          oidcOut = { enabled: false }
+        }
+        let credsOut
+        if (keepPassword && typeof creds.hash === 'string') {
+          credsOut = { v: 3, username, hash: creds.hash, ttl }
+        } else {
+          credsOut = { v: 3, username, hash: await hashPassword(password), ttl }
+        }
+        if (oidcOut) credsOut.oidc = oidcOut
         await writeCredentials(ctx, credsOut)
         enabledFlag = true
         if (wasEnabled) {
@@ -1398,11 +1945,11 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: configure')
+  }), 'dsh-webui-oauth: configure')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-webui-auth/disable',
+    path: '/dsh-webui-oauth/disable',
     handler: async (req, res) => {
       try {
         if (req.method !== 'POST') {
@@ -1438,7 +1985,200 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
-  }), 'dsh-webui-auth: disable')
+  }), 'dsh-webui-oauth: disable')
+
+  // ---------------- OIDC SSO 端点 ----------------
+
+  // 发起 OIDC 授权：GET /dsh-webui-oauth/oidc/login?base=<前端origin>
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/login',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        const creds = await readCredentials(ctx)
+        const o = oidcOf(creds)
+        if (!oidcEnabled(creds)) {
+          sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
+          return
+        }
+        // 决定回调 base：trustBrowserOrigin=true 时信前端 origin，否则仅配置；都没有则 fail-closed。
+        let frontendBase = null
+        if (typeof req.url === 'string') {
+          const m = /[?&]base=([^&]+)/.exec(req.url)
+          if (m) { try { frontendBase = decodeURIComponent(m[1]) } catch (e) { frontendBase = null } }
+        }
+        const base = resolveOidcBase(o, frontendBase)
+        if (!base) {
+          sendJson(res, 200, { ok: false, error: 'oidc-base-unresolvable', hint: '请在设置中配置 redirectBase（反代场景），或让浏览器从登录页发起 SSO 登录' })
+          return
+        }
+        const redirectUri = base.replace(/\/$/, '') + OIDC_CALLBACK_PATH
+        // 拉取 Discovery（缓存）；失败则引导检查 issuer 配置。
+        const disc = await oidcDiscovery.get(o.issuer)
+        if (!disc.ok || !disc.metadata) {
+          const meta = requestMeta(req)
+          await auditLog(ctx, 'oidc_discovery_failure', { issuer: o.issuer, ip: meta.ip, ua: meta.ua, detail: disc.error })
+          sendJson(res, 200, { ok: false, error: 'oidc-discovery-failed', detail: disc.error })
+          return
+        }
+        // 生成 state / nonce / PKCE verifier，暂存。
+        const state = oidcRandom(24)
+        const nonce = oidcRandom(24)
+        const verifier = oidcRandom(32)
+        oidcStates.set(state, { nonce, verifier, redirectUri, createdAt: Date.now() })
+        const authUrl = new URL(disc.metadata.authorization_endpoint)
+        authUrl.searchParams.set('response_type', 'code')
+        authUrl.searchParams.set('client_id', o.clientId)
+        authUrl.searchParams.set('redirect_uri', redirectUri)
+        authUrl.searchParams.set('scope', typeof o.scope === 'string' && o.scope.trim() ? o.scope.trim() : 'openid profile email')
+        authUrl.searchParams.set('state', state)
+        authUrl.searchParams.set('nonce', nonce)
+        authUrl.searchParams.set('code_challenge', oidcChallenge(verifier))
+        authUrl.searchParams.set('code_challenge_method', 'S256')
+        authUrl.searchParams.set('prompt', 'select_account')
+        // 登录 CSRF 绑定：把 state 同时写进一个 HttpOnly 短时效 Cookie。回调时两者必须
+        // 同时匹配——否则攻击者可先在自己的浏览器发起授权拿到 state，再诱导受害者带着
+        // 该 state 完成回调，把受害者的浏览器登录进攻击者的账号（会话固定/登录 CSRF）。
+        res.setHeader('Set-Cookie', COOKIE_OIDC_STATE + '=' + state + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + Math.floor(OIDC_STATE_TTL_MS / 1000))
+        res.writeHead(302, { location: authUrl.href })
+        res.end()
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc login')
+
+  // OIDC 回调：GET /dsh-webui-oauth/oidc/callback?code&state
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/callback',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        const params = new URL(req.url || '/', 'http://dsh.invalid').searchParams
+        const code = params.get('code')
+        const state = params.get('state')
+        const meta = requestMeta(req)
+        const creds = await readCredentials(ctx)
+        const o = oidcOf(creds)
+        if (!oidcEnabled(creds)) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'OIDC 未配置' })
+          sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
+          return
+        }
+        // state 校验（防 CSRF/重放）：消费即删。
+        if (!state || !oidcStates.has(state)) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'state 无效或过期' })
+          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' })
+          return
+        }
+        const st = oidcStates.get(state)
+        oidcStates.delete(state)
+        // 登录 CSRF 绑定：回调必须由发起授权的同一浏览器完成（携带同值 Cookie）。
+        // 只校验 state 存在于服务端集合不足以阻止“攻击者取 state、受害者完成回调”。
+        if (cookieOf(req, COOKIE_OIDC_STATE) !== state) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'state Cookie 不匹配（疑似登录 CSRF）' })
+          const securityHeaders = { 'Set-Cookie': COOKIE_OIDC_STATE + '=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' }
+          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, securityHeaders)
+          return
+        }
+        if (!code) {
+          const err = params.get('error') || 'missing-code'
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: '授权被拒或缺少 code: ' + sanitizeSub(err) })
+          sendJson(res, 200, { ok: false, error: 'oidc-authorize-failed', detail: err })
+          return
+        }
+        // 换 token（authorization_code + PKCE verifier + client_secret）
+        const disc = await oidcDiscovery.get(o.issuer)
+        if (!disc.ok || !disc.metadata) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'Discovery 失败 ' + disc.error })
+          sendJson(res, 200, { ok: false, error: 'oidc-discovery-failed' })
+          return
+        }
+        const tokParams = new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: st.redirectUri,
+          client_id: o.clientId,
+          client_secret: o.clientSecret,
+          code_verifier: st.verifier,
+        })
+        let tokenRes
+        try {
+          tokenRes = await fetch(disc.metadata.token_endpoint, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+            body: tokParams,
+            redirect: 'error',
+          })
+        } catch (e) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'token 端点连接失败' })
+          sendJson(res, 200, { ok: false, error: 'oidc-token-failed' })
+          return
+        }
+        const tokenText = await tokenRes.text()
+        let tokenBody = null
+        try { tokenBody = JSON.parse(tokenText) } catch (e) { /* ignore */ }
+        const idToken = tokenBody && typeof tokenBody.id_token === 'string' ? tokenBody.id_token : null
+        if (!idToken) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'token 响应缺少 id_token' })
+          sendJson(res, 200, { ok: false, error: 'oidc-no-id-token' })
+          return
+        }
+        // 验证 id_token
+        const vres = validateIdToken(idToken, { issuer: o.issuer, clientId: o.clientId, nonce: st.nonce, jwks: disc.jwks })
+        if (!vres.ok) {
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'id_token 验证失败: ' + vres.error })
+          sendJson(res, 200, { ok: false, error: 'oidc-invalid-id-token', detail: vres.error })
+          return
+        }
+        // 建本地会话。身份用**原始 sub**（sanitize 是有损的：'a/b' 与 'a_b' 会塌成同一个
+        // 本地用户名，拿它当身份会张冠李戴）；审计里才用 sanitizeSub 过滤后的短标识。
+        const rawSub = vres.payload.sub
+        const auditName = sanitizeSub(rawSub)
+        const s = createSession(rawSub, ttlOf(creds))
+        res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
+        await auditLog(ctx, 'oidc_login_success', { username: auditName, ip: meta.ip, ua: meta.ua })
+        sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc callback')
+
+  // 简单版 OIDC 登出：POST /dsh-webui-oauth/oidc/logout
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/logout',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (enabledFlag && !checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const token = cookieOf(req, COOKIE_NAME)
+        const s = token ? sessions.get(token) : null
+        destroySession(req)
+        res.setHeader('Set-Cookie', clearSessionCookie())
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'oidc_logout', { username: s ? s.username : null, ip: meta.ip, ua: meta.ua })
+        sendJson(res, 200, { ok: true })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc logout')
 
   // ---------------- 传输层拦截 ----------------
 
@@ -1472,10 +2212,10 @@ export async function apply(ctx) {
           res.end()
           return
         }
-        res.writeHead(302, { location: '/dsh-webui-auth/login' })
+        res.writeHead(302, { location: '/dsh-webui-oauth/login' })
         res.end()
       } catch (e) {
-        ctx.logger.warn('[dsh-webui-auth] intercept error: ' + (e && e.message ? e.message : String(e)))
+        ctx.logger.warn('[dsh-webui-oauth] intercept error: ' + (e && e.message ? e.message : String(e)))
         if (!res.headersSent) {
           res.writeHead(500)
           res.end()
@@ -1484,7 +2224,7 @@ export async function apply(ctx) {
         }
       }
     },
-  }), 'dsh-webui-auth: transport gate')
+  }), 'dsh-webui-oauth: transport gate')
 }
 
 // ---------------- CLI：node index.js audit [--limit N] ----------------
@@ -1530,7 +2270,7 @@ if (isCliEntry) {
         }
       } catch (e) { /* 文件尚不存在 */ }
     }
-    console.log('[dsh-webui-auth] 审计日志：最近 ' + rows.length + ' 条' + (file ? '（文件: ' + file + '）' : ''))
+    console.log('[dsh-webui-oauth] 审计日志：最近 ' + rows.length + ' 条' + (file ? '（文件: ' + file + '）' : ''))
     if (rows.length === 0) {
       console.log('（暂无审计记录；登录/配置等安全事件会追加写入插件目录的 audit.jsonl）')
     }
@@ -1542,7 +2282,7 @@ if (isCliEntry) {
       console.log('  ' + parts.join('  '))
     }
   } else {
-    console.log('[dsh-webui-auth] 用法: node index.js audit [--limit N]')
+    console.log('[dsh-webui-oauth] 用法: node index.js audit [--limit N]')
   }
   process.exit(0)
 }

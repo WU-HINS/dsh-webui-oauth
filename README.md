@@ -1,8 +1,25 @@
-# dsh-webui-auth
+# dsh-webui-oauth
 
 [English](README.en.md) | 中文
 
-DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认证」或首次访问登录页创建账号密码后，**未认证的浏览器无法加载 WebUI 的任何资源、调用任何接口或建立任何实时连接**——认证在 HTTP/传输层强制执行，不可通过浏览器开发者工具绕过。
+DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认证」或首次访问登录页创建账号密码后，**未认证的浏览器无法加载 WebUI 的任何资源、调用任何接口或建立任何实时连接**——认证在 HTTP/传输层强制执行，不可通过浏览器开发者工具绕过。支持本地账号密码与 **OIDC/SSO 单点登录**两种方式。
+
+> **本插件是 [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth) 的增强替代版**（新增 OIDC SSO 等）。若两者同时安装，**本插件启动时会主动停用原版**（见「与原版的关系」），不会出现双闸门；凭据与数据目录沿用原版位置，**原有账号与登录会话继续有效**。
+
+## 与原版的关系（自动顶掉原版）
+
+原版 `dsh-webui-auth` 与本插件都通过运行时包装 `webServer` 路由实现认证。若两套闸门同时存活，同一请求会被两套会话各校验一次，且登录态互不相认（在一个闸门登录后，另一个仍返回 302/401），表现为「登录后反复跳转」。
+
+因此本插件在启动时（安装自己的闸门之前）会遍历 cordis 插件注册表，按插件名找到已加载的原版并 **dispose 掉它的全部 fiber**。原版自身是可逆设计，卸载后其路由包装与端点注册会被完整撤销，随后由本插件接管全部闸门。宿主日志会出现：
+
+```
+[dsh-webui-oauth] displaced original plugin(s): dsh-webui-auth — this plugin takes over the auth gate; credentials/data directory are shared.
+```
+
+- **只按插件名匹配**，不会影响任何其他插件；找不到原版时静默继续。
+- **数据无缝衔接**：数据目录（`.dsh-webui-auth/`）与凭据文件（`dsh-webui-auth.json`）**刻意沿用原名**，原版创建的账号无需迁移即可登录。
+- 源码 / `link:` 安装时，若插件目录旁存在原版目录且其中已有凭据，本插件会优先复用该数据目录（仅在自身尚无凭据时）。
+- 卸载原版、只留本插件同样正常工作。
 
 ## 架构
 
@@ -21,60 +38,65 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 - **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
 - **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `requestRejection` / `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
 - **登录后跳转的协议自适应（0.3.3，修 #6 / #7）**：插件登录成功后要把浏览器引导到核心的带 token 根地址，其 **authority 取自本次请求的 Host**（不再写死 `127.0.0.1`），**scheme 按请求实际协议解析**，优先级：① 操作者显式声明 `remote-web-ui.publicBaseUrl`（**仅当其 host/port 与本次请求 Host 一致时**采信——否则局域网直连会被重定向到公网地址、跨源丢掉刚下发的会话 Cookie）；② 标准代理头 `X-Forwarded-Proto`（取最左值）或 RFC 7239 `Forwarded: proto=`；③ socket 自身是 TLS（插件直接终结 TLS）；④ 兜底 `http`。**刻意不做「非 IP 域名即 https」的猜测**——那会把纯 http 的内网域名访问（`http://nas.local:3080`）打成 https 死链。前端登录页另有一层单向兜底：页面在 https 下收到**同源** `http://` 跳转时自动升级为 `https://`（反向不降级、异源不改写）。
+- **可选 OIDC 单点登录（0.4.0）**：标准 OIDC 授权码 + PKCE（机密客户端，须 `client_secret`），以 Logto 为安全基准。配置后登录页出现「SSO 单点登录」按钮，认证通过后以 IdP 的 `sub` 建立本地会话（沿用会话有效期与持久化）。**redirect_uri 的 base 由 `oidc.redirectBase` 决定；默认 `trustBrowserOrigin: true` 时交给浏览器自行处理（采信前端 `location.origin`，反代重写 Host 时浏览器看到的公网地址即正确），关闭时仅用配置的 `redirectBase`；两者都不可用则 fail-closed 报错。** 支持 RSA/EC/EdDSA 签名的 id_token 验证（JWKS + iss/aud/exp/iat/nbf/nonce 校验），简单版登出（仅清本地会话）。
 
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
 ## 安装
 
-本插件是标准**组合包（bundle）**，已发布到 npm，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
+本插件是标准**组合包（bundle）**，推荐用 DSH 官方 `plugin` 命令安装；手动方式保留作备用。前提：机器上有 pnpm（Node 自带 corepack，执行 `corepack enable pnpm` 即可启用）。
 
-### 方式一：npm 安装（推荐）
-
-```sh
-npx @deepseek-ai/dsh plugin --profile web add dsh-webui-auth
-```
-
-从 npm registry 拉取预构建代码（纯 JS 包，无 prepare 脚本、无需构建授权），加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
-
-### 方式二：GitHub 安装
+### 方式一：GitHub 安装（推荐）
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
+npx @deepseek-ai/dsh plugin --profile web add github:WU-HINS/dsh-webui-oauth
 ```
 
-拉取仓库源码（同样直接可用，无需构建步骤）；网络不佳时优先用方式一。
+拉取仓库源码（纯 JS 包，直接可用，无需构建步骤）。
+
+### 方式二：npm 安装
+
+> 需要该包已发布到 npm registry。若 `dsh-webui-oauth` 尚未发布，请使用方式一。
+
+```sh
+npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
+```
+
+从 npm registry 拉取，加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
+
+> 若你此前装的是原版 `github:Yuuz12/dsh-webui-auth`，可以直接改装本仓库——本插件会自动顶掉原版并沿用原数据目录，账号无需重建。
 
 ### 方式三：手动（备用）
 
-1. 将 `dsh-webui-auth` 目录放入 `profiles/web/node_modules/`
+1. 将 `dsh-webui-oauth` 目录放入 `profiles/web/node_modules/`
 2. 在 `profiles/web/cordis.patch.yml` 的 `insert` 列表中加一行：
 
 ```yaml
-    - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+    - id: dsh-webui-oauth
+      name: 'dsh-webui-oauth'
 ```
 
-> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-auth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
+> 维护者开发模式：在本地源码目录使用 `dsh plugin --profile web add ./dsh-webui-oauth`（`link:` 安装），改代码 → 重启 DSH 即生效，无需重新安装。
 
 ### 所有方式通用
 
-安装后**无需任何核心包补丁**（无 `[dsh-webui-auth patch]` 标记、不改 `node_modules`），重启 DSH 即生效。插件启动时在宿主日志打印 `[dsh-webui-auth] started, credentials file: ...`；若路由包装不完整会打印 `ROUTE GATE INCOMPLETE`，此时认证无法启用（fail-closed）。
+安装后**无需任何核心包补丁**（无 `[dsh-webui-auth patch]` 标记、不改 `node_modules`），重启 DSH 即生效。插件启动时在宿主日志打印 `[dsh-webui-oauth] started, credentials file: ...`；若路由包装不完整会打印 `ROUTE GATE INCOMPLETE`，此时认证无法启用（fail-closed）。
 
 ## 卸载
 
 ### 方式一：`dsh plugin` 命令（对应方式一安装）
 
-1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-auth`（同时移除依赖与组合包层）
+1. `npx @deepseek-ai/dsh plugin --profile web remove dsh-webui-oauth`（同时移除依赖与组合包层）
 2. 重启 DSH
 
 ### 方式二：手动（对应方式二安装）
 
-1. 删除插件目录 `profiles/web/node_modules/dsh-webui-auth/`（0.3.1 起运行数据在包外，删它不影响账号；如需连账号一起清除，另删数据目录 `.dsh-webui-auth/`，见「数据文件位置」）
+1. 删除插件目录 `profiles/web/node_modules/dsh-webui-oauth/`（0.3.1 起运行数据在包外，删它不影响账号；如需连账号一起清除，另删数据目录 `.dsh-webui-auth/`，见「数据文件位置」）
 2. 从 `profiles/web/cordis.patch.yml` 移除挂载行：
 
 ```yaml
-    - id: dsh-webui-auth
-      name: 'dsh-webui-auth'
+    - id: dsh-webui-oauth
+      name: 'dsh-webui-oauth'
 ```
 
    此步必须做，否则重启时加载器找不到插件包会报错
@@ -84,11 +106,12 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 ## 使用
 
-- **首次启用（需 setup token）**：未配置凭据时认证自动关闭（所有请求放行），但创建管理员账号需要**本次启动生成的 setup token**——打开 WebUI → 设置 → 身份认证，或访问 `/dsh-webui-auth/login`，输入启动日志中打印的 `[dsh-webui-auth] setup token (...)`（或数据目录 `setup-token` 文件内容，0600）后创建账号密码（≥8 位，含大小写字母、数字、特殊符号）。token 每次启动重新生成、创建成功后即删除，防止「先暴露、后配置」窗口内被他人抢先注册。
+- **首次启用（需 setup token）**：未配置凭据时认证自动关闭（所有请求放行），但创建管理员账号需要**本次启动生成的 setup token**——打开 WebUI → 设置 → 身份认证，或访问 `/dsh-webui-oauth/login`，输入启动日志中打印的 `[dsh-webui-oauth] setup token (...)`（或数据目录 `setup-token` 文件内容，0600）后创建账号密码（≥8 位，含大小写字母、数字、特殊符号）。token 每次启动重新生成、创建成功后即删除，防止「先暴露、后配置」窗口内被他人抢先注册。
 - **用户名规则**：3-32 位字母、数字、下划线或连字符（新建/修改时强制；旧账号不受影响，仍可正常登录）。
 - **之后**：未登录访问任意路径 → 跳转登录页；登录后按「会话有效期」免登录（浏览器会话 / 1 小时 / 12 小时（默认）/ 1 天 / 3 天），服务端按到期时间强制失效。**会话持久化到磁盘，重启 DSH 后已登录设备无需重新登录**（到期时间仍生效）。「浏览器会话」模式：活跃使用期间自动续期（30 分钟窗口），关闭浏览器即失效。
 - **修改 / 禁用 / 退出**：设置 → 身份认证（均需当前密码）；修改密码会吊销其他所有已登录会话。
 - **忘记密码**：删除数据目录的 `dsh-webui-auth.json` 即可——后台每分钟自动检测，最多 1 分钟内认证自动关闭（无需重启），之后用新的 setup token 重新创建账号即可。
+- **OIDC 单点登录（可选）**：设置 → 身份认证 → 勾选「启用 OIDC 单点登录」，填写 Issuer（IdP 地址，须 https）、Client ID、Client Secret（机密客户端必填）、Scope、Redirect Base（可选）。保存后登录页出现「SSO 单点登录」按钮：点按后跳转 IdP 授权，回调中插件验证 state/nonce/PKCE/签名后建立本地会话（用户名 = IdP `sub`）。**redirect_uri 的 base**：`trustBrowserOrigin` 默认开启时采信浏览器 `location.origin`（反代重写 Host 时正确）；关闭时仅用 `redirectBase`；两者皆无则报错不跳转。**反代重写 Host 场景请配置 `redirectBase`**（部署者已知对外真实地址，是唯一不受反代影响的确定性答案）。登出为简单版：仅清本地会话，不调 IdP 单点登出。
 
 ## 数据文件位置（按安装方式区分）
 
@@ -104,7 +127,7 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 
 | 文件 | 用途 | 权限 |
 |---|---|---|
-| `dsh-webui-auth.json` | 凭据（scrypt 哈希，v3 格式；0.2.x 的 v2 凭据仍可正常登录校验） | — |
+| `dsh-webui-auth.json` | 凭据（scrypt 哈希，v3 格式；0.2.x 的 v2 凭据仍可正常登录校验）+ 可选 OIDC 配置段（v4 写入 `oidc` 字段） | — |
 | `audit.jsonl` | 审计日志（IP 已假名化，见「审计日志」节） | — |
 | `sessions.jsonl` | 持久化会话（重启恢复用） | 0600 |
 | `audit-hmac-key` | 审计 IP 假名化的 HMAC 密钥（首次自动生成） | 0600 |
@@ -143,7 +166,8 @@ npx @deepseek-ai/dsh plugin --profile web add github:Yuuz12/dsh-webui-auth
 - 会话持久化：`sessions.jsonl`（0600），重启恢复；写失败时认证不受影响，设置页提示重启后需重新登录。
 - 登录页与 API 响应均带安全头：严格 CSP、`nosniff`、`DENY` 防嵌框、`no-referrer`、`noindex`、`no-store`。
 - Cookie `HttpOnly + SameSite=Lax`：JS 不可读、跨站请求不携带。
-- 登录/初始化端点本身公开（认证的必然入口）：`/dsh-webui-auth/login`、`/dsh-webui-auth/setup`（后者受 setup token 保护）。
+- 登录/初始化端点本身公开（认证的必然入口）：`/dsh-webui-oauth/login`、`/dsh-webui-oauth/setup`（后者受 setup token 保护）。
+- **OIDC 单点登录**：authorization_code + PKCE + client_secret（机密客户端，不做纯 PKCE public client）；state 防 CSRF、nonce 防重放、redirect_uri 精确匹配（base + 固定路径）、id_token 经 JWKS 验签并校验 iss/aud/exp/iat/nbf/nonce、仅接受 HTTPS 端点；审计只记录经 `sanitizeSub` 过滤的 `sub`。OIDC 客户端配置（含 secret）与密码凭据同存于 `dsh-webui-auth.json`（0600 数据目录）。
 
 ## 已知边界
 

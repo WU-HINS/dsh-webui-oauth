@@ -1,10 +1,10 @@
 {
-  "name": "dsh-webui-auth",
-  "version": "0.3.3",
+  "name": "dsh-webui-oauth",
+  "version": "0.4.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "node test/redirect-scheme.test.mjs"
+    "test": "node test/redirect-scheme.test.mjs && node test/oidc.test.mjs && node test/oidc-integration.test.mjs && node test/displace-original.test.mjs"
   },
   "exports": {
     ".": "./index.js",
@@ -41,5 +41,5 @@
       ]
     }
   },
-  "description": "Persistent WebUI authentication plugin for DeepSeek Harness: configure an account/password in Settings, then accessing the WebUI requires login. Zero dependencies."
+  "description": "WebUI authentication plugin for DeepSeek Harness: password or OIDC/SSO login enforced at the HTTP/transport layer, with server-side sessions, HttpOnly cookies and audit logging. Zero dependencies."
 }
