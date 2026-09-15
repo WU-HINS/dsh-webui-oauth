@@ -1292,6 +1292,14 @@ function postLoginRedirect(ctx, req) {
       : ''
     const host = headerHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
     const scheme = headerHost ? resolveRedirectScheme(ctx, req, host) : 'http'
+    // 与 OIDC 回调共用同一个开关与白名单：开关关闭、或请求 Host 未命中白名单时，
+    // 改用配置的确定性 origin（publicBaseUrl），而不是把 token 交到浏览器可影响的
+    // authority 上。两者都没有 → 保持原有兜底（请求 Host / 回环）。
+    const policy = trustedOriginPolicy(ctx, null)
+    if (headerHost && (!policy.trust || !originMatches(scheme + '://' + headerHost, policy.allowList))) {
+      const configured = configuredOrigin(ctx)
+      if (configured !== null) return conn.authenticatedUrl(configured)
+    }
     return conn.authenticatedUrl(scheme + '://' + host)
   } catch (e) {
     return '/'
@@ -1341,15 +1349,95 @@ export function isValidOrigin(raw) {
   return true
 }
 
-// 决定 OIDC 回调的 base origin。
-//   trustBrowserOrigin=true  → 前端 origin 优先，缺失/非法回退 redirectBase；
-//   trustBrowserOrigin=false → 仅 redirectBase；
-//   两者都不可用 → null（调用方 fail-closed 报错）。
-export function resolveOidcBase(oidc, frontendOrigin) {
-  const trust = !oidc || oidc.trustBrowserOrigin !== false
+// 规范化 origin 为 scheme://host[:port]（小写化、去尾斜杠），供白名单比较。
+function normOrigin(origin) {
+  try {
+    const url = new URL(origin)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    return url.protocol.slice(0, -1) + '://' + url.host.toLowerCase()
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * origin 白名单匹配。list 为空 = 不约束（返回 true，保持未配置白名单时的原有行为）。
+ * 命中判定按规范化 origin（scheme + host + port）精确相等，不做通配符：
+ * 白名单是"允许哪些 origin"的显式列举，任何通配符都会重新打开宽匹配的口子。
+ */
+export function originMatches(origin, list) {
+  if (!Array.isArray(list) || list.length === 0) return true
+  const candidate = normOrigin(origin)
+  if (candidate === null) return false
+  for (const one of list) {
+    if (typeof one !== 'string') continue
+    if (normOrigin(one) === candidate) return true
+  }
+  return false
+}
+
+/**
+ * 统一的"是否采信浏览器可影响的 origin"策略。同一个开关同时约束两处：
+ *   - OIDC 回调 base（浏览器上报的前端 location.origin）；
+ *   - 登录成功后交给核心的 token 跳转（authority 取自请求 Host，同样由浏览器发出）。
+ *
+ * 配置位置：dsh settings 的 remote-web-ui 段（部署级），如
+ *   remote-web-ui:
+ *     trustBrowserOrigin: false          # 关闭：两处都只用配置值
+ *     trustedOrigins:                    # 开启时（或省略时）允许的 origin 白名单
+ *       - 'https://dsh.example.com:8443'
+ * 省略 trustBrowserOrigin 时默认 true；为兼容旧部署，同时接受 OIDC 配置对象内的
+ * trustBrowserOrigin（settings 未配置时回退它）。
+ *
+ * @returns {{ trust: boolean, allowList: string[] }}
+ */
+export function trustedOriginPolicy(ctx, oidc) {
+  let section = null
+  try {
+    const settings = ctx && typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+    if (settings && typeof settings.get === 'function') section = settings.get(PUBLIC_BASE_NAMESPACE)
+  } catch (e) { section = null }
+  const trust = section && typeof section.trustBrowserOrigin === 'boolean'
+    ? section.trustBrowserOrigin
+    : (!oidc || oidc.trustBrowserOrigin !== false)
+  let allowList = []
+  if (section && Array.isArray(section.trustedOrigins)) {
+    allowList = section.trustedOrigins.filter((o) => typeof o === 'string' && o.trim())
+  }
+  return { trust, allowList }
+}
+
+// 取配置的确定性 origin（remote-web-ui.publicBaseUrl 的 scheme://host[:port]）。
+// 开关关闭或白名单未命中时用它替代浏览器可影响的 origin。
+function configuredOrigin(ctx) {
+  try {
+    const settings = ctx.get('settings')
+    if (!settings || typeof settings.get !== 'function') return null
+    const section = settings.get(PUBLIC_BASE_NAMESPACE)
+    const raw = section && typeof section.publicBaseUrl === 'string' ? section.publicBaseUrl.trim() : ''
+    if (!raw) return null
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    return url.protocol.slice(0, -1) + '://' + url.host
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * 决定 OIDC 回调的 base origin。
+ *   policy.trust=true  → 前端 origin 优先（须过 isValidOrigin 与白名单），
+ *                        缺失/非法/未命中则回退 redirectBase；
+ *   policy.trust=false → 仅 redirectBase；
+ *   两者都不可用 → null（调用方 fail-closed 报错）。
+ * policy 省略时回退到 oidc.trustBrowserOrigin（旧配置），再回退默认 true。
+ */
+export function resolveOidcBase(oidc, frontendOrigin, policy) {
+  const trust = policy ? policy.trust : (!oidc || oidc.trustBrowserOrigin !== false)
+  const allowList = policy && Array.isArray(policy.allowList) ? policy.allowList : []
   const configBase = oidc && typeof oidc.redirectBase === 'string' ? oidc.redirectBase : null
   if (trust) {
-    if (isValidOrigin(frontendOrigin)) return frontendOrigin
+    if (isValidOrigin(frontendOrigin) && originMatches(frontendOrigin, allowList)) return frontendOrigin
     if (isValidOrigin(configBase)) return configBase
     return null
   }
@@ -1976,6 +2064,12 @@ export async function apply(ctx) {
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
           gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
+          trustedOrigin: (() => {
+            try {
+              const pol = trustedOriginPolicy(ctx, oidcCfg)
+              return { trustBrowserOrigin: pol.trust, trustedOrigins: pol.allowList, configuredOrigin: configuredOrigin(ctx) }
+            } catch (e) { return null }
+          })(),
           oidc: oidcOn ? { enabled: true, issuer: oidcCfg.issuer, clientId: oidcCfg.clientId, scope: oidcCfg.scope, redirectBase: oidcCfg.redirectBase, trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false } : { enabled: false },
         })
       } catch (e) {
@@ -2194,13 +2288,13 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
           return
         }
-        // 决定回调 base：trustBrowserOrigin=true 时信前端 origin，否则仅配置；都没有则 fail-closed。
+        // 决定回调 base：与登录后 token 跳转共用 remote-web-ui 段的统一开关与白名单。
         let frontendBase = null
         if (typeof req.url === 'string') {
           const m = /[?&]base=([^&]+)/.exec(req.url)
           if (m) { try { frontendBase = decodeURIComponent(m[1]) } catch (e) { frontendBase = null } }
         }
-        const base = resolveOidcBase(o, frontendBase)
+        const base = resolveOidcBase(o, frontendBase, trustedOriginPolicy(ctx, o))
         if (!base) {
           sendJson(res, 200, { ok: false, error: 'oidc-base-unresolvable', hint: '请在设置中配置 redirectBase（反代场景），或让浏览器从登录页发起 SSO 登录' })
           return
