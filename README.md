@@ -41,21 +41,18 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 - **与核心自带浏览器认证（v0.1.2-alpha.2+）协作**：该版本核心自带 launch-token 交换的签名 Cookie（`dsh-auth-*`）认证 `/` 与 `/api`。插件登录成功后自动把浏览器引导到核心的带 token 根 URL 完成核心 Cookie 交换；`/api` 请求在插件会话校验后**原样转交**给核心（不再改写 Host/Origin，避免破坏核心 Cookie 与 Host 绑定）。两者叠加：浏览器须同时持有插件会话 Cookie 与核心 Cookie。
 - **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
 - **WebSocket 与 trustedHosts**：WS 升级握手仍受核心自身 `requestRejection` / `isTrustedApiRequest` 限制，因此**反代/局域网（非回环 Host）部署下，WS 下行需要同时在 dsh 配置中把对外域名加入 `client-connection.trustedHosts`**，否则即使已登录也会被拒绝升级。
-- **浏览器可影响 origin 的统一开关（0.4.1）**：有两处跳转会采信**请求方（浏览器）提供的 origin**——① OIDC 回调 base（登录页上报 `location.origin`）；② 登录成功后交给核心的 token 跳转（authority 取自请求 `Host`）。两处**共用同一个开关与白名单**，配置在 dsh settings 的 `remote-web-ui` 段（部署级）：
+- **浏览器可影响 origin 的统一开关（0.4.1）**：有两处跳转会采信**请求方（浏览器）提供的 origin**——① OIDC 回调 base（登录页上报 `location.origin`）；② 登录成功后交给核心的 token 跳转（authority 取自请求 `Host`）。两处**共用同一个开关**，配置在 dsh settings 的 `remote-web-ui` 段（部署级）：
   ```yaml
   remote-web-ui:
     publicBaseUrl: 'https://dsh.example.com:8443'   # 确定性 origin（可选）
     trustBrowserOrigin: false                       # 关闭：两处都只用上面这个确定性 origin
-    trustedOrigins:                                 # 开启时（或省略开关时）允许的 origin 白名单
       - 'https://dsh.example.com:8443'
   ```
   - `trustBrowserOrigin` 省略时默认 `true`（保持旧行为）；显式 `false` 时两处都**忽略**浏览器可影响的 origin，改用 `publicBaseUrl`；若连 `publicBaseUrl` 也没有，token 跳转退回请求 Host/回环兜底，OIDC 则 fail-closed 报错。
-  - `trustedOrigins` 为空 = 不约束（旧行为）；非空时按**规范化 origin**（scheme + host + port）精确相等匹配，**不支持通配符**——通配符会重新打开宽匹配的口子。命中失败同样回退 `publicBaseUrl`。
-  - 当前生效值可在 `/dsh-webui-oauth/status` 的 `trustedOrigin` 字段查看（含 `trustBrowserOrigin`、`trustedOrigins`、`configuredOrigin`）。
   - 旧配置 `oidc.trustBrowserOrigin` 仍被接受：settings 段未显式配置时回退它，便于已有部署平滑升级。
-  - **反代改写 Host 的场景**：反代把 `Host` 改写成回环地址（`127.0.0.1:3080`、`::1`、`localhost`、`0.0.0.0`）且**不下发任何头**时，服务端**无法**从请求得知浏览器侧地址，因此判为"反代已改写"，直接采信配置的 `publicBaseUrl`（该值来自 `settings.yaml`，运维可控、非攻击者可控，不构成开放重定向）。此前 README 建议的「在 settings.yaml 声明对外地址」在这种形态下**并不生效**——因为 `publicBaseUrl` 只在与请求 Host 精确一致时才被采信。若反代能下发原始主机，`X-Forwarded-Host`（或 RFC 7239 `Forwarded: host=`）优先于请求 Host，用于白名单比对与跳转目标生成。
+  - **反代改写 Host 的场景**：反代把 `Host` 改写成回环地址（`127.0.0.1:3080`、`::1`、`localhost`、`0.0.0.0`）且**不下发任何头**时，服务端**无法**从请求得知浏览器侧地址，因此判为"反代已改写"，直接采信配置的 `publicBaseUrl`（该值来自 `settings.yaml`，运维可控、非攻击者可控，不构成开放重定向）。此前 README 建议的「在 settings.yaml 声明对外地址」在这种形态下**并不生效**——因为 `publicBaseUrl` 只在与请求 Host 精确一致时才被采信。若反代能下发原始主机，`X-Forwarded-Host`（或 RFC 7239 `Forwarded: host=`）优先于请求 Host，用于跳转目标生成。
 - **登录后跳转的协议自适应（0.3.3，修 #6 / #7）**：插件登录成功后要把浏览器引导到核心的带 token 根地址，其 **authority 取自本次请求的 Host**（不再写死 `127.0.0.1`），**scheme 按请求实际协议解析**，优先级：① 操作者显式声明 `remote-web-ui.publicBaseUrl`（**仅当其 host/port 与本次请求 Host 一致时**采信——否则局域网直连会被重定向到公网地址、跨源丢掉刚下发的会话 Cookie）；② 标准代理头 `X-Forwarded-Proto`（取最左值）或 RFC 7239 `Forwarded: proto=`；③ socket 自身是 TLS（插件直接终结 TLS）；④ 兜底 `http`。**刻意不做「非 IP 域名即 https」的猜测**——那会把纯 http 的内网域名访问（`http://nas.local:3080`）打成 https 死链。前端登录页另有一层单向兜底：页面在 https 下收到**同源** `http://` 跳转时自动升级为 `https://`（反向不降级、异源不改写）。
-- **可选 OIDC 单点登录（0.4.0）**：标准 OIDC 授权码 + PKCE（机密客户端，须 `client_secret`），以 Logto 为安全基准。配置后登录页出现「SSO 单点登录」按钮，认证通过后以 IdP 的 `sub` 建立本地会话（沿用会话有效期与持久化）。**redirect_uri 的 base 由 `oidc.redirectBase` 决定；默认交由浏览器处理（采信前端 `location.origin`，反代重写 Host 时浏览器看到的公网地址即正确），受上面统一开关与白名单约束；关闭时仅用配置的 `redirectBase`；两者都不可用则 fail-closed 报错。** 支持 RSA/EC/EdDSA 签名的 id_token 验证（JWKS + iss/aud/exp/iat/nbf/nonce 校验），简单版登出（仅清本地会话）。
+- **可选 OIDC 单点登录（0.4.0）**：标准 OIDC 授权码 + PKCE（机密客户端，须 `client_secret`），以 Logto 为安全基准。配置后登录页出现「SSO 单点登录」按钮，认证通过后以 IdP 的 `sub` 建立本地会话（沿用会话有效期与持久化）。**redirect_uri 的 base 由 `oidc.redirectBase` 决定；默认交由浏览器处理（采信前端 `location.origin`，反代重写 Host 时浏览器看到的公网地址即正确），受上面统一开关约束；关闭时仅用配置的 `redirectBase`；两者都不可用则 fail-closed 报错。** 支持 RSA/EC/EdDSA 签名的 id_token 验证（JWKS + iss/aud/exp/iat/nbf/nonce 校验），简单版登出（仅清本地会话）。
 
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 

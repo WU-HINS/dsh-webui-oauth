@@ -62,18 +62,18 @@ eq('回环但无配置 origin → 兜底回环（不引入新失败态）',
   postLoginRedirect(mkCtx(SEC({})), req({ host: '127.0.0.1:3080' })),
   'http://127.0.0.1:3080/?token=abc')
 
-console.log('\n— Host 已透传原始地址：按统一开关与白名单 —')
+console.log('\n— Host 已透传原始地址：按统一开关 —')
 eq('透传公网 + 默认开关 → 用请求 Host',
   postLoginRedirect(mkCtx(PUB), req({ host: 'dsh.example.com:8443', 'x-forwarded-proto': 'https' })),
   'https://dsh.example.com:8443/?token=abc')
 eq('透传公网 + 开关关闭 → 用配置 origin',
   postLoginRedirect(mkCtx(SEC({ publicBaseUrl: 'https://dsh.example.com:8443', trustBrowserOrigin: false })), req({ host: 'lan.internal:8443' })),
   'https://dsh.example.com:8443/?token=abc')
-eq('透传公网 + 白名单未命中 → 用配置 origin',
-  postLoginRedirect(mkCtx(SEC({ publicBaseUrl: 'https://dsh.example.com:8443', trustedOrigins: ['https://other.example'] })), req({ host: 'lan.internal:8443' })),
-  'https://dsh.example.com:8443/?token=abc')
+eq('透传公网 + 开关开启 → 用请求 Host（不约束）',
+  postLoginRedirect(mkCtx(PUB), req({ host: 'lan.internal:8443' })),
+  'http://lan.internal:8443/?token=abc')
 
-console.log('\n— 原始主机头必须经白名单过滤（防注入与污染）—')
+console.log('\n— 原始主机头必须经形状校验（防注入与污染）—')
 eq('原始头带路径 → 拒收，回退配置',
   postLoginRedirect(mkCtx(PUB), req({ host: '127.0.0.1:3080', 'x-forwarded-host': 'evil.example/../x' })),
   'https://dsh.example.com:8443/?token=abc')
@@ -83,10 +83,10 @@ eq('原始头带 CRLF → 拒收',
 eq('原始头非主机形状 → 拒收',
   postLoginRedirect(mkCtx(PUB), req({ host: '127.0.0.1:3080', 'x-forwarded-host': 'not a host' })),
   'https://dsh.example.com:8443/?token=abc')
-eq('原始头命中白名单外 → 回退配置（不采信未授权 origin）',
-  postLoginRedirect(mkCtx(SEC({ publicBaseUrl: 'https://dsh.example.com:8443', trustedOrigins: ['https://dsh.example.com:8443'] })),
-    req({ host: '127.0.0.1:3080', 'x-forwarded-host': 'evil.example', 'x-forwarded-proto': 'https' })),
-  'https://dsh.example.com:8443/?token=abc')
+eq('原始头合法形状 → 采信（开关开启时不额外约束）',
+  postLoginRedirect(mkCtx(PUB),
+    req({ host: '127.0.0.1:3080', 'x-forwarded-host': 'other.example:8443', 'x-forwarded-proto': 'https' })),
+  'https://other.example:8443/?token=abc')
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail === 0 ? 0 : 1)

@@ -1221,7 +1221,7 @@ function proxyProto(req) {
  *
  * 为什么需要它：反代常把 Host 改写成内网回环地址（如 127.0.0.1:3080），此时
  * req.headers.host 已不是浏览器侧地址。若反代下发了原始主机头，采信它才能
- * 在反代场景下正确比对白名单、正确决定跳转目标。
+ * 在反代场景下正确决定跳转目标。
  *
  * 仅接受 host[:port] 形状（字母/数字/点/连字符/下划线，可选端口；IPv6 加方括号），
  * 且拒绝任何控制字符与路径分隔符——杜绝 CRLF 头注入与把 origin 污染成 URL。
@@ -1331,7 +1331,7 @@ function declaredScheme(ctx, host) {
 // （http://nas.local:3080）打成 https 死链。此类部署应显式声明 publicBaseUrl，
 // 或让反代下发 X-Forwarded-Proto。
 // 1/2 的取值都只影响「发起本次请求的那个浏览器」自身的跳转（三个调用点都在
-// 已认证响应内），且经白名单过滤，不构成跨用户影响，也不构成开放重定向。
+// 已认证响应内），不构成跨用户影响，也不构成开放重定向。
 function resolveRedirectScheme(ctx, req, host) {
   const declared = declaredScheme(ctx, host)
   if (declared) return declared
@@ -1355,22 +1355,22 @@ function postLoginRedirect(ctx, req) {
     const proxiedHost = proxyHost(req)
     const brawserHost = proxiedHost || headerHost
     const scheme = brawserHost ? resolveRedirectScheme(ctx, req, brawserHost) : 'http'
-    // 与 OIDC 回调共用同一个开关与白名单。判据用**浏览器侧地址**：
-    //   1. 反代下发了原始主机头 → 它是权威的，按白名单判断（未命中则回退配置）；
+    // 与 OIDC 回调共用同一个开关。判据用**浏览器侧地址**：
+    //   1. 反代下发了原始主机头 → 它是权威的，据开关决定是否采信（关闭则回退配置）；
     //   2. 否则地址为回环/本机 → 反代改写 Host 的典型特征，服务端无法得知浏览器侧
     //      地址，直接用配置的确定性 origin（publicBaseUrl 来自 settings.yaml，运维可控，
     //      非攻击者可控，不构成开放重定向）；
-    //   3. 其余（Host 已透传原始地址）→ 按开关与白名单判断，未命中回退配置。
+    //   3. 其余（Host 已透传原始地址）→ 据开关决定，关闭则回退配置。
     const policy = trustedOriginPolicy(ctx, null)
     const configured = configuredOrigin(ctx)
     if (proxiedHost) {
-      if (!policy.trust || !originMatches(scheme + '://' + proxiedHost, policy.allowList)) {
+      if (!policy.trust) {
         if (configured !== null) return conn.authenticatedUrl(configured)
       }
     } else if (headerHost && isLoopbackHost(headerHost)) {
       if (configured !== null) return conn.authenticatedUrl(configured)
     } else if (headerHost) {
-      if (!policy.trust || !originMatches(scheme + '://' + headerHost, policy.allowList)) {
+      if (!policy.trust) {
         if (configured !== null) return conn.authenticatedUrl(configured)
       }
     }
@@ -1424,47 +1424,24 @@ export function isValidOrigin(raw) {
   return true
 }
 
-// 规范化 origin 为 scheme://host[:port]（小写化、去尾斜杠），供白名单比较。
-function normOrigin(origin) {
-  try {
-    const url = new URL(origin)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-    return url.protocol.slice(0, -1) + '://' + url.host.toLowerCase()
-  } catch (e) {
-    return null
-  }
-}
-
 /**
- * origin 白名单匹配。list 为空 = 不约束（返回 true，保持未配置白名单时的原有行为）。
- * 命中判定按规范化 origin（scheme + host + port）精确相等，不做通配符：
- * 白名单是"允许哪些 origin"的显式列举，任何通配符都会重新打开宽匹配的口子。
- */
-export function originMatches(origin, list) {
-  if (!Array.isArray(list) || list.length === 0) return true
-  const candidate = normOrigin(origin)
-  if (candidate === null) return false
-  for (const one of list) {
-    if (typeof one !== 'string') continue
-    if (normOrigin(one) === candidate) return true
-  }
-  return false
-}
-
-/**
- * 统一的"是否采信浏览器可影响的 origin"策略。同一个开关同时约束两处：
+ * 统一的"是否采信浏览器可影响的 origin"开关。同一个开关同时约束两处：
  *   - OIDC 回调 base（浏览器上报的前端 location.origin）；
  *   - 登录成功后交给核心的 token 跳转（authority 取自请求 Host，同样由浏览器发出）。
  *
- * 配置位置：dsh settings 的 remote-web-ui 段（部署级），如
+ * 配置位置：dsh settings 的 remote-web-ui 段（部署级）：
  *   remote-web-ui:
- *     trustBrowserOrigin: false          # 关闭：两处都只用配置值
- *     trustedOrigins:                    # 开启时（或省略时）允许的 origin 白名单
- *       - 'https://dsh.example.com:8443'
- * 省略 trustBrowserOrigin 时默认 true；为兼容旧部署，同时接受 OIDC 配置对象内的
- * trustBrowserOrigin（settings 未配置时回退它）。
+ *     publicBaseUrl: 'https://dsh.example.com:8443'   # 关闭开关时的确定性 origin
+ *     trustBrowserOrigin: false
+ * 省略时默认 true（保持旧行为）；为兼容旧部署，settings 未配置时回退 OIDC 配置对象
+ * 内的 trustBrowserOrigin。
  *
- * @returns {{ trust: boolean, allowList: string[] }}
+ * 刻意**只留开关、不做 origin 白名单**：采信判定本身已有格式校验（isValidOrigin /
+ * proxyHost 的形状白名单），且 OIDC 侧还有 PKCE + client_secret + id_token 验签
+ * （iss/aud/nonce/jwks）多重把关，密码侧有强度要求——再加一层 origin 白名单属于
+ * 重复设防，反而让反代改写 Host 的部署难以配置。
+ *
+ * @returns {{ trust: boolean }}
  */
 export function trustedOriginPolicy(ctx, oidc) {
   let section = null
@@ -1475,15 +1452,11 @@ export function trustedOriginPolicy(ctx, oidc) {
   const trust = section && typeof section.trustBrowserOrigin === 'boolean'
     ? section.trustBrowserOrigin
     : (!oidc || oidc.trustBrowserOrigin !== false)
-  let allowList = []
-  if (section && Array.isArray(section.trustedOrigins)) {
-    allowList = section.trustedOrigins.filter((o) => typeof o === 'string' && o.trim())
-  }
-  return { trust, allowList }
+  return { trust }
 }
 
 // 取配置的确定性 origin（remote-web-ui.publicBaseUrl 的 scheme://host[:port]）。
-// 开关关闭或白名单未命中时用它替代浏览器可影响的 origin。
+// 开关关闭或浏览器侧地址不可得时用它替代。
 function configuredOrigin(ctx) {
   try {
     const settings = ctx.get('settings')
@@ -1501,18 +1474,16 @@ function configuredOrigin(ctx) {
 
 /**
  * 决定 OIDC 回调的 base origin。
- *   policy.trust=true  → 前端 origin 优先（须过 isValidOrigin 与白名单），
- *                        缺失/非法/未命中则回退 redirectBase；
- *   policy.trust=false → 仅 redirectBase；
+ *   trust=true  → 前端 origin 优先（须过 isValidOrigin），缺失/非法则回退 redirectBase；
+ *   trust=false → 仅 redirectBase；
  *   两者都不可用 → null（调用方 fail-closed 报错）。
  * policy 省略时回退到 oidc.trustBrowserOrigin（旧配置），再回退默认 true。
  */
 export function resolveOidcBase(oidc, frontendOrigin, policy) {
   const trust = policy ? policy.trust : (!oidc || oidc.trustBrowserOrigin !== false)
-  const allowList = policy && Array.isArray(policy.allowList) ? policy.allowList : []
   const configBase = oidc && typeof oidc.redirectBase === 'string' ? oidc.redirectBase : null
   if (trust) {
-    if (isValidOrigin(frontendOrigin) && originMatches(frontendOrigin, allowList)) return frontendOrigin
+    if (isValidOrigin(frontendOrigin)) return frontendOrigin
     if (isValidOrigin(configBase)) return configBase
     return null
   }
@@ -2142,7 +2113,7 @@ export async function apply(ctx) {
           trustedOrigin: (() => {
             try {
               const pol = trustedOriginPolicy(ctx, oidcCfg)
-              return { trustBrowserOrigin: pol.trust, trustedOrigins: pol.allowList, configuredOrigin: configuredOrigin(ctx) }
+              return { trustBrowserOrigin: pol.trust, configuredOrigin: configuredOrigin(ctx) }
             } catch (e) { return null }
           })(),
           oidc: oidcOn ? { enabled: true, issuer: oidcCfg.issuer, clientId: oidcCfg.clientId, scope: oidcCfg.scope, redirectBase: oidcCfg.redirectBase, trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false } : { enabled: false },
@@ -2363,7 +2334,7 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
           return
         }
-        // 决定回调 base：与登录后 token 跳转共用 remote-web-ui 段的统一开关与白名单。
+        // 决定回调 base：与登录后 token 跳转共用 remote-web-ui 段的统一开关。
         let frontendBase = null
         if (typeof req.url === 'string') {
           const m = /[?&]base=([^&]+)/.exec(req.url)
