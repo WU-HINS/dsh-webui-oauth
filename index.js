@@ -200,7 +200,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath, sendJson, makeOidcStateStore }
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -603,9 +603,23 @@ function sendJson(res, status, body, extraHeaders) {
     'x-content-type-options': 'nosniff',
     'cache-control': 'no-store',
   }
+  // Set-Cookie 是唯一允许重复的响应头：一次响应可能既要下发会话 Cookie、又要清除
+  // 一次性的 state Cookie。普通对象合并会互相覆盖，故这里把 Set-Cookie 收集成数组
+  // （node:http 对数组值会逐条写出多个同名头）。
+  const setCookies = []
   if (extraHeaders && typeof extraHeaders === 'object') {
-    for (const k of Object.keys(extraHeaders)) headers[k] = extraHeaders[k]
+    for (const k of Object.keys(extraHeaders)) {
+      if (k.toLowerCase() === 'set-cookie') {
+        const v = extraHeaders[k]
+        if (Array.isArray(v)) setCookies.push(...v)
+        else if (v !== undefined) setCookies.push(v)
+        continue
+      }
+      headers[k] = extraHeaders[k]
+    }
   }
+  if (setCookies.length === 1) headers['Set-Cookie'] = setCookies[0]
+  else if (setCookies.length > 1) headers['Set-Cookie'] = setCookies
   res.writeHead(status, headers)
   res.end(text)
 }
@@ -1298,7 +1312,13 @@ function postLoginRedirect(ctx, req) {
 //   - 审计只记录 sanitizeSub() 过滤后的 subject，杜绝注入。
 
 const OIDC_CALLBACK_PATH = '/dsh-webui-oauth/oidc/callback'
+// 授权请求状态（state / nonce / PKCE verifier）的存活时间。三次握手应在分钟内
+// 完成，10 分钟足够覆盖用户在 IdP 侧慢慢登录的情形，又限制了被滥用的窗口。
 const OIDC_STATE_TTL_MS = 10 * 60 * 1000
+// 同时在途的授权请求上限。`/oidc/login` 是公开端点，若只按 TTL 淘汰，攻击者可在
+// 10 分钟窗口内灌入无上限的 state 把内存撑爆（每条约几百字节）。超过上限时按
+// 【最早创建】淘汰，保证正常用户（并发量远低于此）不受影响。
+const OIDC_MAX_PENDING_STATES = 1000
 
 // 纯 origin 格式校验：http/https、无 path/query/hash、无 userinfo。
 // 刻意**不做** host 匹配——trustBrowserOrigin 语义即"信前端 origin"，
@@ -1586,6 +1606,66 @@ function makeDiscoveryCache() {
   return { get }
 }
 
+/**
+ * OIDC 授权请求的临时状态表（state → nonce / PKCE verifier / redirectUri）。
+ *
+ * TTL 语义（要点：**过期判定在读取时同步完成**，不能只依赖后台轮询）：
+ *   - 写入时即算出 expiresAt = now + ttlMs；
+ *   - take() 读到已过期条目按"不存在"处理并顺手删除——否则后台轮询（60s 一次）
+ *     之间的空档里，过期 state 仍能兑换授权码，TTL 形同虚设；
+ *   - 后台轮询仅作兜底回收（长时间无请求时清残留），不承担正确性；
+ *   - 超过 maxPending 时淘汰**最早创建**的条目：`/oidc/login` 是公开端点，
+ *     只按 TTL 淘汰的话，攻击者能在 TTL 窗口内灌入无上限条目把内存撑爆；
+ *     正常并发量远低于该上限，故不会影响真实用户。
+ * nonce / verifier 与 state 同生共死：它们只在这一次授权往返中有意义。
+ *
+ * 抽成独立工厂便于单测（可用注入的 now/ttl 精确验证过期边界）。
+ */
+function makeOidcStateStore(opts) {
+  const ttlMs = (opts && opts.ttlMs) || OIDC_STATE_TTL_MS
+  const maxPending = (opts && opts.maxPending) || OIDC_MAX_PENDING_STATES
+  const now = (opts && opts.now) || Date.now
+  const map = new Map() // 保持插入序：首个即最旧
+
+  function purge() {
+    const t = now()
+    for (const [k, v] of map) if (v.expiresAt <= t) map.delete(k)
+  }
+
+  function put(state, data) {
+    const t = now()
+    // 先回收过期项，再按容量淘汰最旧者。
+    for (const [k, v] of map) if (v.expiresAt <= t) map.delete(k)
+    while (map.size >= maxPending) {
+      const oldest = map.keys().next()
+      if (oldest.done) break
+      map.delete(oldest.value)
+    }
+    map.set(state, { ...data, createdAt: t, expiresAt: t + ttlMs })
+    return true
+  }
+
+  /** 取出并消费；不存在或已过期均返回 null（过期项顺手清理）。 */
+  function take(state) {
+    if (typeof state !== 'string' || !state) return null
+    const entry = map.get(state)
+    if (!entry) return null
+    map.delete(state) // 一次性：无论是否过期都不再可用
+    if (entry.expiresAt <= now()) return null
+    return entry
+  }
+
+  /**
+   * 仅查询存在性（不消费、不判过期）。用于把"从未见过的 state"与"见过但已过期"
+   * 在审计里区分开——注意它**不能**替代 take() 的过期判定。
+   */
+  function has(state) {
+    return typeof state === 'string' && !!state && map.has(state)
+  }
+
+  return { put, take, has, purge, size: () => map.size }
+}
+
 export async function apply(ctx) {
   // 顶掉原版 dsh-webui-auth（若已加载）：必须在安装本插件闸门之前完成，
   // 否则会出现两套闸门并存的窗口。
@@ -1633,6 +1713,12 @@ export async function apply(ctx) {
     const arr = (failuresByIp.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS)
     arr.push(now)
     failuresByIp.set(ip, arr)
+    if (failuresByIp.size > 10000) {
+      for (const [key, times] of failuresByIp) {
+        const alive = times.filter((t) => now - t < RATE_WINDOW_MS)
+        if (alive.length === 0) failuresByIp.delete(key)
+      }
+    }
   }
 
   function checkRequest(req) {
@@ -1645,13 +1731,15 @@ export async function apply(ctx) {
       sessions.delete(token)
       return false
     }
-    if (s.browser === true) s.expiresAt = Date.now() + SESSION_BROWSER_TTL_MS
+    if (s.browser === true) s.expiresAt = Date.now() + SESSION_TTL_MS
     return true
   }
 
+  const SESSION_TTL_MS = SESSION_BROWSER_TTL_MS
+
   function createSession(username, ttl) {
     const token = randomBytes(24).toString('hex')
-    const ttlMs = ttl > 0 ? ttl * 3600 * 1000 : SESSION_BROWSER_TTL_MS
+    const ttlMs = ttl > 0 ? ttl * 3600 * 1000 : SESSION_TTL_MS
     sessions.set(token, { username, expiresAt: Date.now() + ttlMs, browser: ttl <= 0 })
     return { token, maxAge: ttl > 0 ? ttl * 3600 : undefined }
   }
@@ -1684,6 +1772,13 @@ export async function apply(ctx) {
     ctx.logger.info('[dsh-webui-oauth] setup token (first-run administrator creation): ' + SETUP_TOKEN)
   }
 
+  // ---------------- OIDC SSO（可选） ----------------
+
+  // 授权请求状态表（TTL + 容量上限），见 makeOidcStateStore 的说明。
+  // 必须在后台定时器使用 purge 之前定义。
+  const oidcStateStore = makeOidcStateStore()
+  const purgeExpiredOidcStates = oidcStateStore.purge
+
   // 后台任务：过期会话清理 + enabled 状态刷新
   const bgTimer = setInterval(async () => {
     const now = Date.now()
@@ -1695,12 +1790,6 @@ export async function apply(ctx) {
     } catch (e) { /* keep last state */ }
   }, 60000)
   ctx.effect(() => () => clearInterval(bgTimer), 'dsh-webui-oauth: background timer')
-
-  // ---------------- OIDC SSO（可选） ----------------
-
-  // 内存暂存 OIDC 授权请求状态：{ state -> { nonce, verifier, redirectUri, createdAt } }
-  // 状态一次消费即删，防 CSRF/重放；10 分钟过期，后台定时惰性清理。
-  const oidcStates = new Map()
   const oidcDiscovery = makeDiscoveryCache()
   // OIDC 配置改由独立文件承载（dsh-webui-oauth.json），读取回落旧布局，
   // 因此这里变成异步。oidcOf/oidcEnabled 统一走这条路径，避免各处各自读。
@@ -1711,10 +1800,6 @@ export async function apply(ctx) {
   async function oidcEnabled(creds) {
     const o = await oidcOf(creds)
     return !!(o && o.enabled === true && typeof o.issuer === 'string' && typeof o.clientId === 'string' && typeof o.clientSecret === 'string')
-  }
-  function purgeExpiredOidcStates() {
-    const now = Date.now()
-    for (const [k, v] of oidcStates) if (now - v.createdAt > OIDC_STATE_TTL_MS) oidcStates.delete(k)
   }
 
   // ---------------- 端点 ----------------
@@ -2129,11 +2214,11 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'oidc-discovery-failed', detail: disc.error })
           return
         }
-        // 生成 state / nonce / PKCE verifier，暂存。
+        // 生成 state / nonce / PKCE verifier，按 TTL 暂存（含容量上限，防灌爆）。
         const state = oidcRandom(24)
         const nonce = oidcRandom(24)
         const verifier = oidcRandom(32)
-        oidcStates.set(state, { nonce, verifier, redirectUri, createdAt: Date.now() })
+        oidcStateStore.put(state, { nonce, verifier, redirectUri })
         const authUrl = new URL(disc.metadata.authorization_endpoint)
         authUrl.searchParams.set('response_type', 'code')
         authUrl.searchParams.set('client_id', o.clientId)
@@ -2177,20 +2262,23 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
           return
         }
-        // state 校验（防 CSRF/重放）：消费即删。
-        if (!state || !oidcStates.has(state)) {
-          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'state 无效或过期' })
-          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' })
+        // state 校验（防 CSRF/重放）：读取时同步判定 TTL 并消费。
+        // 区分"未知/已用"与"已过期"，便于审计与用户排查；两者都拒绝。
+        const known = oidcStateStore.has(state)
+        const st = oidcStateStore.take(state)
+        // 无论成功与否都清掉绑定 Cookie：它只服务于这一次授权往返。
+        const clearStateCookie = { 'Set-Cookie': COOKIE_OIDC_STATE + '=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' }
+        if (!st) {
+          const why = known ? 'state 已过期（TTL ' + Math.round(OIDC_STATE_TTL_MS / 60000) + ' 分钟）' : 'state 无效、已使用或不存在'
+          await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: why })
+          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, clearStateCookie)
           return
         }
-        const st = oidcStates.get(state)
-        oidcStates.delete(state)
         // 登录 CSRF 绑定：回调必须由发起授权的同一浏览器完成（携带同值 Cookie）。
         // 只校验 state 存在于服务端集合不足以阻止“攻击者取 state、受害者完成回调”。
         if (cookieOf(req, COOKIE_OIDC_STATE) !== state) {
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'state Cookie 不匹配（疑似登录 CSRF）' })
-          const securityHeaders = { 'Set-Cookie': COOKIE_OIDC_STATE + '=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' }
-          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, securityHeaders)
+          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, clearStateCookie)
           return
         }
         if (!code) {
@@ -2248,11 +2336,18 @@ export async function apply(ctx) {
         const rawSub = vres.payload.sub
         const auditName = sanitizeSub(rawSub)
         const s = createSession(rawSub, ttlOf(creds))
-        res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         await auditLog(ctx, 'oidc_login_success', { username: auditName, ip: meta.ip, ua: meta.ua })
-        sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
+        // 授权往返结束：同时下发会话 Cookie 并清除一次性的 state 绑定 Cookie。
+        // Set-Cookie 必须走数组（sendJson 已支持多值），否则后者会覆盖前者、
+        // 导致"登录成功却没有会话"。
+        sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) }, {
+          'Set-Cookie': [sessionCookie(s.token, s.maxAge), clearStateCookie['Set-Cookie']],
+        })
       } catch (e) {
-        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+        // 这里可能带上用户可控内容（如 code 解码、payload 结构异常），
+        // 若原样回显会变成反射型注入的落点，因此固定文案、细节只进服务端日志。
+        ctx.logger?.warn?.('[dsh-webui-oauth] oidc callback 处理失败:', e)
+        sendJson(res, 500, { error: 'oidc-callback-failed' })
       }
     },
   }), 'dsh-webui-oauth: oidc callback')

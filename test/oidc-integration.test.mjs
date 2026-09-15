@@ -159,8 +159,20 @@ function makeRes() {
 const getCookie = (res, name) => {
   const sc = res.headers && res.headers['Set-Cookie']
   if (!sc) return null
-  const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]*)').exec(sc)
-  return m ? m[1] : null
+  // 一次响应可能携带多条 Set-Cookie（回调成功时同时下发会话 Cookie 与清除一次性
+  // state Cookie），node:http 对数组值会写成多个同名头——都要检查。
+  const list = Array.isArray(sc) ? sc : [sc]
+  for (const one of list) {
+    const m = new RegExp('(?:^|;\\s*)' + name + '=([^;]*)').exec(one)
+    if (m) return m[1]
+  }
+  return null
+}
+/** 收集一次响应里的全部 Set-Cookie（数组形式）。 */
+const allCookies = (res) => {
+  const sc = res.headers && res.headers['Set-Cookie']
+  if (!sc) return []
+  return Array.isArray(sc) ? sc : [sc]
 }
 /**
  * 模拟浏览器：走一次 /oidc/login 拿 302 → 访问 IdP 授权端点 → 跟随回调用 code 换会话。
@@ -272,6 +284,12 @@ let loginRes = null, stateFromCookie = null
   eq('回跳核心带 launch token', typeof p.redirect === 'string' && p.redirect.includes('token=launch'), String(p.redirect))
   const sess = getCookie(callbackRes, 'dsh_wua_session')
   eq('下发会话 Cookie', !!sess && sess.length > 20, String(sess))
+  // 回调成功必须【同时】下发会话 Cookie 与清除一次性 state Cookie。
+  // 二者都是 Set-Cookie：若实现用普通对象合并会互相覆盖，表现成"登录成功却没有会话"。
+  const cbs = allCookies(callbackRes)
+  eq('响应含两条 Set-Cookie', cbs.length === 2, JSON.stringify(cbs))
+  eq('其一为会话 Cookie', cbs.some((c) => c.startsWith('dsh_wua_session=')), JSON.stringify(cbs))
+  eq('其二清除 state Cookie', cbs.some((c) => c.startsWith('dsh_wua_oidc_state=;')), JSON.stringify(cbs))
   eq('token 端点收到 client_secret', (idpState.tokenBody || {}).client_secret, JSON.stringify(idpState.tokenBody))
   eq('token 端点收到 code_verifier', !!(idpState.tokenBody || {}).code_verifier, JSON.stringify(idpState.tokenBody))
   eq('token 端点回传同一 redirect_uri',
