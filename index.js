@@ -1215,6 +1215,66 @@ function proxyProto(req) {
   return null
 }
 
+/**
+ * 从标准代理头解析浏览器侧看到的原始主机（authority 形式 host[:port]）。
+ * X-Forwarded-Host 优先，其次 RFC 7239 Forwarded 的 host= 参数。
+ *
+ * 为什么需要它：反代常把 Host 改写成内网回环地址（如 127.0.0.1:3080），此时
+ * req.headers.host 已不是浏览器侧地址。若反代下发了原始主机头，采信它才能
+ * 在反代场景下正确比对白名单、正确决定跳转目标。
+ *
+ * 仅接受 host[:port] 形状（字母/数字/点/连字符/下划线，可选端口；IPv6 加方括号），
+ * 且拒绝任何控制字符与路径分隔符——杜绝 CRLF 头注入与把 origin 污染成 URL。
+ */
+function proxyHost(req) {
+  try {
+    const headers = req && req.headers
+    if (!headers) return null
+    const candidate = firstHop(headers['x-forwarded-host'])
+      || (() => {
+        const forwarded = typeof headers.forwarded === 'string' ? headers.forwarded.split(',')[0] : ''
+        const m = /(?:^|;)\s*host\s*=\s*"?([^";\s]+)"?/.exec(forwarded)
+        return m ? m[1].trim() : ''
+      })()
+    const raw = String(candidate || '').trim()
+    if (!raw) return null
+    if (/[\x00-\x1f\x7f/\\?#@]/.test(raw)) return null
+    if (!/^(\[[0-9a-f:]+\]|[a-z0-9._-]+)(:\d{1,5})?$/.test(raw.toLowerCase())) return null
+    return raw
+  } catch (e) { /* ignore */ }
+  return null
+}
+
+// 判断 authority 是否指向回环/本机 —— 反代改写 Host 的典型特征。此时服务端
+// 不可能从请求 Host 得知浏览器侧地址，配置的确定性 origin 才是正确答案。
+const LOOPBACK_NAMES = [
+  '127.0.0.1', '::1', '[::1]', 'localhost', '0.0.0.0',
+  '::ffff:127.0.0.1', '[::ffff:127.0.0.1]',
+]
+function isLoopbackHost(host) {
+  const raw = String(host || '').trim().toLowerCase()
+  if (!raw) return false
+  // 逐个候选形态皆比：原样、去尾端口、方括号内地址。
+  // 裸 IPv6（"::1"、"::1:3080"）不能用 split(':')[0] 取主机名（会得空串），
+  // 用 Realm URL 规范化也不可靠（"::1" 不是合法 URL），故直接做字面比对。
+  const candidates = [raw]
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']')
+    if (end !== -1) {
+      candidates.push(raw.slice(0, end + 1)) // 含方括号的地址
+      candidates.push(raw.slice(1, end))    // 去方括号
+    }
+  } else {
+    const i = raw.lastIndexOf(':')
+    if (i > 0 && raw.indexOf(':') === i) {
+      candidates.push(raw.slice(0, i))       // 普通 host:port → host
+    } else if (i > 0 && raw.slice(0, i).includes(':')) {
+      candidates.push(raw.slice(0, i))       // 裸 IPv6:port → IPv6
+    }
+  }
+  return candidates.some((c) => LOOPBACK_NAMES.includes(c))
+}
+
 // 拆分 authority 为 hostname + 端口（未显式给端口时按 fallbackScheme 取默认值）。
 function splitAuthority(authority, fallbackScheme) {
   const raw = String(authority || '').trim().toLowerCase()
@@ -1290,16 +1350,31 @@ function postLoginRedirect(ctx, req) {
     const headerHost = (req && req.headers && typeof req.headers.host === 'string' && req.headers.host.trim())
       ? req.headers.host.trim()
       : ''
-    const host = headerHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
-    const scheme = headerHost ? resolveRedirectScheme(ctx, req, host) : 'http'
-    // 与 OIDC 回调共用同一个开关与白名单：开关关闭、或请求 Host 未命中白名单时，
-    // 改用配置的确定性 origin（publicBaseUrl），而不是把 token 交到浏览器可影响的
-    // authority 上。两者都没有 → 保持原有兜底（请求 Host / 回环）。
+    // 浏览器侧地址：原始主机头优先（反代常改写 Host，此时请求 Host 是内网地址），
+    // 其次才用请求 Host。这与 scheme 侧的解析（proxyProto 优先于 socket）相对称。
+    const proxiedHost = proxyHost(req)
+    const brawserHost = proxiedHost || headerHost
+    const scheme = brawserHost ? resolveRedirectScheme(ctx, req, brawserHost) : 'http'
+    // 与 OIDC 回调共用同一个开关与白名单。判据用**浏览器侧地址**：
+    //   1. 反代下发了原始主机头 → 它是权威的，按白名单判断（未命中则回退配置）；
+    //   2. 否则地址为回环/本机 → 反代改写 Host 的典型特征，服务端无法得知浏览器侧
+    //      地址，直接用配置的确定性 origin（publicBaseUrl 来自 settings.yaml，运维可控，
+    //      非攻击者可控，不构成开放重定向）；
+    //   3. 其余（Host 已透传原始地址）→ 按开关与白名单判断，未命中回退配置。
     const policy = trustedOriginPolicy(ctx, null)
-    if (headerHost && (!policy.trust || !originMatches(scheme + '://' + headerHost, policy.allowList))) {
-      const configured = configuredOrigin(ctx)
+    const configured = configuredOrigin(ctx)
+    if (proxiedHost) {
+      if (!policy.trust || !originMatches(scheme + '://' + proxiedHost, policy.allowList)) {
+        if (configured !== null) return conn.authenticatedUrl(configured)
+      }
+    } else if (headerHost && isLoopbackHost(headerHost)) {
       if (configured !== null) return conn.authenticatedUrl(configured)
+    } else if (headerHost) {
+      if (!policy.trust || !originMatches(scheme + '://' + headerHost, policy.allowList)) {
+        if (configured !== null) return conn.authenticatedUrl(configured)
+      }
     }
+    const host = brawserHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
     return conn.authenticatedUrl(scheme + '://' + host)
   } catch (e) {
     return '/'
