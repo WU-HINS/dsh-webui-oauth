@@ -41,5 +41,9 @@
       ]
     }
   },
-  "description": "WebUI authentication plugin for DeepSeek Harness: password or OIDC/SSO login enforced at the HTTP/transport layer, with server-side sessions, HttpOnly cookies and audit logging. Zero dependencies."
+  "description": "WebUI authentication plugin for DeepSeek Harness: password or OIDC/SSO login enforced at the HTTP/transport layer, with server-side sessions, HttpOnly cookies and audit logging. Zero dependencies.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WU-HINS/dsh-webui-oauth.git"
+  }
 }
