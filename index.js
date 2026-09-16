@@ -1353,8 +1353,8 @@ function postLoginRedirect(ctx, req) {
     // 浏览器侧地址：原始主机头优先（反代常改写 Host，此时请求 Host 是内网地址），
     // 其次才用请求 Host。这与 scheme 侧的解析（proxyProto 优先于 socket）相对称。
     const proxiedHost = proxyHost(req)
-    const brawserHost = proxiedHost || headerHost
-    const scheme = brawserHost ? resolveRedirectScheme(ctx, req, brawserHost) : 'http'
+    const browserHost = proxiedHost || headerHost
+    const scheme = browserHost ? String(resolveRedirectScheme(ctx, req, browserHost) || '').replace(/:\/\/.*$/, '') : 'http'
     // 与 OIDC 回调共用同一个开关。判据用**浏览器侧地址**：
     //   1. 反代下发了原始主机头 → 它是权威的，据开关决定是否采信（关闭则回退配置）；
     //   2. 否则地址为回环/本机 → 反代改写 Host 的典型特征，服务端无法得知浏览器侧
@@ -1374,7 +1374,7 @@ function postLoginRedirect(ctx, req) {
         if (configured !== null) return conn.authenticatedUrl(configured)
       }
     }
-    const host = brawserHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
+    const host = browserHost || ('127.0.0.1:' + String((ctx.get('webServer') && ctx.get('webServer').port) || ''))
     return conn.authenticatedUrl(scheme + '://' + host)
   } catch (e) {
     return '/'

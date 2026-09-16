@@ -112,6 +112,13 @@ eq('https 页 + 同源 http:// → 升级 https', runGoTo('http://dsh.example:84
 eq('https 页 + 同源 https:// → 不动', runGoTo('https://dsh.example:8443/?token=abc', 'https:', 'dsh.example:8443'), 'https://dsh.example:8443/?token=abc')
 eq('http 页 + http:// → 不动（不降级）', runGoTo('http://192.168.3.5:3080/?token=abc', 'http:', '192.168.3.5:3080'), 'http://192.168.3.5:3080/?token=abc')
 eq('https 页 + 异源 http:// → 不动', runGoTo('http://evil.example/?token=abc', 'https:', 'dsh.example:8443'), 'http://evil.example/?token=abc')
+// 相对路径形态的 302 Location（302 /?token=... / 302 /oidc）——反代已修复、不再带明文 origin 时走这条
+eq('相对路径 redirect → 原样（不升级）', runGoTo('/?token=abc', 'https:', 'dsh.example:8443'), '/?token=abc')
+eq('相对路径 redirect → 原样（不升级）', runGoTo('/dsh-webui-oauth/oidc/login/callback?token=abc', 'https:', 'dsh.example:8443'), '/dsh-webui-oauth/oidc/login/callback?token=abc')
+// 显式用例：302 Location 的 host 不在浏览地址栏里，浏览器按页面当前 scheme 补全成
+// https://dsh.example:8443/?token=... 再执行跳转 —— 必须与相对路径同解，不得回退明文
+eq('相对路径 "?token=" → 原样（浏览器补全为当前 origin）', runGoTo('?token=abc', 'https:', 'dsh.example:8443'), '?token=abc')
+eq('相对路径 "/xxx/oidc" → 原样', runGoTo('/xxx/oidc', 'https:', 'dsh.example:8443'), '/xxx/oidc')
 eq('redirect 缺失 → "/"', runGoTo(undefined, 'https:', 'dsh.example'), '/')
 eq('redirect 非字符串 → "/"', runGoTo({ evil: 1 }, 'https:', 'dsh.example'), '/')
 
