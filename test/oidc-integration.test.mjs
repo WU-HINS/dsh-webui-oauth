@@ -284,22 +284,26 @@ let loginRes = null, stateFromCookie = null
   const res = makeRes()
   await routes.get('/dsh-webui-oauth/oidc/callback').handler(
     makeReq('/dsh-webui-oauth/oidc/callback?code=x&state=bogus'), res)
-  const p = JSON.parse(res.body || '{}')
-  eq('未知 state 被拒', p.ok === false && p.error === 'oidc-invalid-state', res.body)
+  // 失败改为 302 回应用并带 oidcerr 回执（回调是浏览器顶层导航，不能停在 JSON）
+  eq('未知 state 被拒（302 回应用 + oidcerr）',
+    res.status === 302 && /[?&]oidcerr=invalid-state/.test(String(res.headers.location || '')),
+    String(res.status) + ' ' + String(res.headers.location))
 }
 
 // 6) 回调：state 合法但浏览器不带绑定 Cookie → 判定登录 CSRF
 {
   const { callbackRes } = await browserSsoFlow({ cookieOverride: 'dsh_wua_oidc_state=someone-elses-state' })
-  const p = JSON.parse(callbackRes.body || '{}')
-  eq('state Cookie 不符 → 拒绝（登录 CSRF 防护）', p.ok === false && p.error === 'oidc-invalid-state', callbackRes.body)
+  eq('state Cookie 不符 → 拒绝（登录 CSRF 防护）',
+    callbackRes.status === 302 && /[?&]oidcerr=invalid-state/.test(String(callbackRes.headers.location || '')),
+    String(callbackRes.status) + ' ' + String(callbackRes.headers.location))
 }
 
 // 6b) 回调：完全不携带 state Cookie → 同样拒绝
 {
   const { callbackRes } = await browserSsoFlow({ cookieOverride: null })
-  const p = JSON.parse(callbackRes.body || '{}')
-  eq('缺少 state Cookie → 拒绝', p.ok === false && p.error === 'oidc-invalid-state', callbackRes.body)
+  eq('缺少 state Cookie → 拒绝',
+    callbackRes.status === 302 && /[?&]oidcerr=invalid-state/.test(String(callbackRes.headers.location || '')),
+    String(callbackRes.status) + ' ' + String(callbackRes.headers.location))
 }
 
 // 7) 回调：完整成功路径（浏览器真实走一遍 IdP 授权）
@@ -327,7 +331,9 @@ let loginRes = null, stateFromCookie = null
     makeReq('/dsh-webui-oauth/oidc/callback?code=replay&state=' +
       new URL(loginRes.headers.location).searchParams.get('state'),
       { cookie: 'dsh_wua_oidc_state=' + new URL(loginRes.headers.location).searchParams.get('state') }), replay)
-  eq('state 重放被拒（一次性）', JSON.parse(replay.body || '{}').error, 'oidc-invalid-state')
+  eq('state 重放被拒（一次性）',
+    replay.status === 302 && /[?&]oidcerr=invalid-state/.test(String(replay.headers.location || '')),
+    String(replay.status) + ' ' + String(replay.headers.location))
 }
 
 // 8) 会话 Cookie 可访问受保护端点

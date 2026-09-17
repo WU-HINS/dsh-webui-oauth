@@ -377,9 +377,11 @@ console.log('\n— 4. 未绑定/不匹配的 sub 不得建立会话（访问控�
   const cb = makeRes()
   await routes.get('/dsh-webui-oauth/oidc/callback').handler(
     makeReq('/dsh-webui-oauth/oidc/callback?' + back.searchParams.toString(), { cookie: 'dsh_wua_oidc_state=' + state }), cb)
-  const p = JSON.parse(cb.body || '{}')
-  eq('sub 不匹配时拒绝登录', p.ok === false, cb.body)
-  eq('错误为 oidc-sub-mismatch', p.error === 'oidc-sub-mismatch', cb.body)
+  // 失败时不再渲染 JSON，而是 302 回应用并带 oidcerr 回执——
+  // OIDC 回调是浏览器主导的顶层导航，停在 JSON 上等于给用户一个死页面。
+  eq('sub 不匹配时 302 回应用（而非渲染 JSON）', cb.status === 302, String(cb.status))
+  const loc = String(cb.headers.location || '')
+  eq('回执标明 sub 不匹配', /[?&]oidcerr=sub-mismatch/.test(loc), loc)
   eq('未下发会话 Cookie', getCookie(cb, 'dsh_wua_session') === null, JSON.stringify(cb.headers['Set-Cookie']))
 }
 
@@ -398,6 +400,46 @@ console.log('\n— 5. 匹配的 sub 可以登录 —')
   const p = JSON.parse(cb.body || '{}')
   eq('绑定身份登录成功', p.ok === true, cb.body)
   eq('下发会话 Cookie', !!getCookie(cb, 'dsh_wua_session'), JSON.stringify(cb.headers['Set-Cookie']))
+}
+
+console.log('\n— 5b. 绑定成功后必须回到应用，而不是停在 JSON 上 —')
+{
+  // 回归：绑定成功曾只返回 {"ok":true,"bound":true,"sub":"..."}。
+  // 但回调是【浏览器主导的顶层导航】（用户点绑定 → 302 到 IdP → 302 回这里），
+  // 渲染 JSON 会让用户停在一个死页面、必须手动回退——部署者实际就遇到了这个问题。
+  // 正确行为：302 回应用并带 oidcbound=1 回执，由前端提示成功。
+  const session = await loginLocal()
+  const H = { cookie: 'dsh_wua_session=' + session }
+  // 先确保未绑定，走一次完整绑定
+  credsText = JSON.stringify({ ...baseCreds })
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+  })
+
+  const bindRes = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/bind').handler(
+    makeReq('/dsh-webui-oauth/oidc/bind', H), bindRes)
+  eq('发起绑定得到 302 到 IdP', bindRes.status === 302, String(bindRes.status))
+  const authUrl = new URL(bindRes.headers.location)
+  const state = authUrl.searchParams.get('state')
+
+  idpState.sub = 'sub-alice'
+  const authRes = await fetch(authUrl.href, { redirect: 'manual' })
+  const back = new URL(authRes.headers.get('location'))
+  const cb = makeRes()
+  // binding 回调同样需要 state Cookie 绑定
+  const stCookie = getCookie(bindRes, 'dsh_wua_oidc_state') || state
+  await routes.get('/dsh-webui-oauth/oidc/callback').handler(
+    makeReq('/dsh-webui-oauth/oidc/callback?' + back.searchParams.toString(), { cookie: 'dsh_wua_oidc_state=' + stCookie }), cb)
+
+  eq('绑定成功返回 302（而非 JSON）', cb.status === 302, String(cb.status))
+  const loc = String(cb.headers.location || '')
+  eq('回执带 oidcbound=1', /[?&]oidcbound=1/.test(loc), loc)
+  eq('未把 sub 明文放进跳转 URL（避免泄露到历史/日志）',
+    !loc.includes('sub-alice'), loc)
+  const saved = JSON.parse(credsText || '{}')
+  eq('sub 已落库', saved.boundSub === 'sub-alice', String(saved.boundSub))
 }
 
 console.log('\n— 6. 解绑：密码错误被拒，正确则清空并立即失效 —')

@@ -2507,6 +2507,29 @@ export async function apply(ctx) {
    *
    * @returns {Promise<void>} 直接写响应，不返回内容
    */
+  /**
+   * 把浏览器送回应用，并带上一个回执码。
+   *
+   * 为什么需要它：OIDC 回调是**浏览器主导的顶层导航**——用户点「绑定」/「SSO 登录」，
+   * 浏览器 302 到 IdP，IdP 再 302 回本回调。如果这里渲染 JSON，用户就停在一个
+   * 死页面上，只能手动按后退键，而且不知道操作到底成没成功。
+   * 因此成功与失败都应 302 回应用，用 query 参数带上结果，由前端提示。
+   *
+   * 与登录路径一致地复用 postLoginRedirect()：既回到应用根，又能顺带完成
+   * 核心的 launch-token → cookie 交换（否则回到首页仍会被核心 401 拦住）。
+   *
+   * @param res 响应对象
+   * @param code 回执码，前端据此展示提示（如 oidcbound=1 / oidcerr=...）
+   * @param extraHeaders 额外的响应头（如清除一次性 state Cookie）
+   */
+  function redirectBackToApp(ctx2, req, res, code, extraHeaders) {
+    let target = '/'
+    try { target = postLoginRedirect(ctx2, req) || '/' } catch (e) { target = '/' }
+    const sep = target.includes('?') ? '&' : '?'
+    res.writeHead(302, { location: target + sep + code, ...(extraHeaders || {}) })
+    res.end()
+  }
+
   async function startOidcAuthorize(ctx2, req, res, purpose) {
     const creds = await readCredentials(ctx2)
     const o = await oidcOf(creds)
@@ -2688,20 +2711,20 @@ export async function apply(ctx) {
         if (!st) {
           const why = known ? 'state 已过期（TTL ' + Math.round(OIDC_STATE_TTL_MS / 60000) + ' 分钟）' : 'state 无效、已使用或不存在'
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: why })
-          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, clearStateCookie)
+          redirectBackToApp(ctx, req, res, 'oidcerr=invalid-state', clearStateCookie)
           return
         }
         // 登录 CSRF 绑定：回调必须由发起授权的同一浏览器完成（携带同值 Cookie）。
         // 只校验 state 存在于服务端集合不足以阻止“攻击者取 state、受害者完成回调”。
         if (cookieOf(req, COOKIE_OIDC_STATE) !== state) {
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'state Cookie 不匹配（疑似登录 CSRF）' })
-          sendJson(res, 200, { ok: false, error: 'oidc-invalid-state' }, clearStateCookie)
+          redirectBackToApp(ctx, req, res, 'oidcerr=invalid-state', clearStateCookie)
           return
         }
         if (!code) {
           const err = params.get('error') || 'missing-code'
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: '授权被拒或缺少 code: ' + sanitizeSub(err) })
-          sendJson(res, 200, { ok: false, error: 'oidc-authorize-failed', detail: err })
+          redirectBackToApp(ctx, req, res, 'oidcerr=' + encodeURIComponent(err), clearStateCookie)
           return
         }
         // 换 token（authorization_code + PKCE verifier + client_secret）
@@ -2761,7 +2784,7 @@ export async function apply(ctx) {
         }
         if (!vres.ok) {
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'id_token 验证失败: ' + vres.error })
-          sendJson(res, 200, { ok: false, error: 'oidc-invalid-id-token', detail: vres.error })
+          redirectBackToApp(ctx, req, res, 'oidcerr=' + encodeURIComponent(vres.error), clearStateCookie)
           return
         }
         const rawSub = vres.payload.sub
@@ -2774,7 +2797,8 @@ export async function apply(ctx) {
           // 保留原有 username/hash/ttl，只加 boundSub —— 用 spread 以免漏字段。
           await writeCredentials(ctx, { ...creds, boundSub: rawSub })
           await auditLog(ctx, 'oidc_bind_success', { username: auditName, ip: meta.ip, ua: meta.ua })
-          sendJson(res, 200, { ok: true, bound: true, sub: auditName }, clearStateCookie)
+          // 成功必须【把浏览器送回应用】，而不是停在 JSON 上（见 redirectBackToApp 说明）。
+          redirectBackToApp(ctx, req, res, 'oidcbound=1', clearStateCookie)
           return
         }
 
@@ -2784,12 +2808,12 @@ export async function apply(ctx) {
         const bound = boundSubOf(creds)
         if (!bound) {
           await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: '尚未绑定 OIDC 身份，拒绝登录' })
-          sendJson(res, 200, { ok: false, error: 'oidc-not-bound' }, clearStateCookie)
+          redirectBackToApp(ctx, req, res, 'oidcerr=not-bound', clearStateCookie)
           return
         }
         if (!safeTokenEquals(String(rawSub), bound)) {
           await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: 'sub 与已绑定身份不匹配，拒绝登录' })
-          sendJson(res, 200, { ok: false, error: 'oidc-sub-mismatch', detail: '该 IdP 身份未被绑定到本 WebUI' }, clearStateCookie)
+          redirectBackToApp(ctx, req, res, 'oidcerr=sub-mismatch', clearStateCookie)
           return
         }
 
