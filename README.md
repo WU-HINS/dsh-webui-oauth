@@ -355,6 +355,32 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
   另需 `--trusted-host <对外域名:端口>`，否则桌面浏览器直连 `/api` 会 403（见「已知边界」）。
 
+### D. OIDC 授权跳转三路实测（0.6.6 全量验证）
+
+用真实 IdP（HTTPS + 自签 CA）、真实反向代理（两种 Host 改写模式）与真实 dsh 实例，
+端到端跑完「发起授权 → IdP → 回调 → 换 token → 建会话 → 跳回应用」，共 56 项断言全通过。
+下表是三条路径下 `redirect_uri` 与「回调后回跳目标」的实测值：
+
+| 路径 | 关键配置 | IdP 收到的 redirect_uri | 回调后回跳目标 |
+| --- | --- | --- | --- |
+| 固定路径跳转 | `redirectBase=http://127.0.0.1:14080` | `http://127.0.0.1:14080/dsh-webui-oauth/oidc/callback` | `http://127.0.0.1:14080/?…&oidcbound=1` ✅ |
+| 固定路径 + 浏览器谎报异源 | 同上，且 `base=https://evil.example.com` | 仍为配置的 14080 ✅（不被带偏） | 同上 ✅ |
+| 反代（Host 改写 + XFH） | 同上，经 14080 | 配置的 14080 ✅ | 指向 14080（浏览器侧）✅ |
+| 反代（保留原始 Host） | 同上，经 14081 | 配置的 14080 ✅ | 14080，**不指向内网 13081** ✅ |
+| 浏览器动态跳转 | `redirectBase` 留空 + `trustBrowserOrigin=true` | 浏览器上报的 origin ✅ | 回到该 origin ✅ |
+| 动态 + 直通反代 | 同上，经 14081 | `http://127.0.0.1:14081/dsh-webui-oauth/oidc/callback` ✅ | `http://127.0.0.1:14081/?…`（会话不丢）✅ |
+| 动态但开关关闭 | `trustBrowserOrigin=false` 且无 `redirectBase` | **不发起授权**，返回 `oidc-base-unresolvable` ✅ | — |
+
+被明确拒绝的非法输入（均不发起授权、不产生注入）：
+`javascript:alert(1)`、带 path / query / hash / userinfo 的 origin、
+以及含 CRLF 的注入尝试（`https://evil.test/\r\nX-Injected: 1`）。
+
+**关于绑定路径不下发会话 Cookie**：绑定结束时只清一次性 state Cookie。
+这是刻意的——绑定发生在管理员**已登录之后**，复用同一会话即可；重新下发等于无谓轮换凭据。
+登录路径相反，必须同时下发新会话（响应含 2 条 `Set-Cookie`）。此差异已在测试中锁定。
+
+复现方式见 `test/oidc-redirect-matrix.test.mjs`（无需外部依赖的单元回归，已接入 `npm test`）。
+
 ## 已知边界
 
 - **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。

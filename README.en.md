@@ -337,6 +337,36 @@ Preconditions: **no** `remote-web-ui.publicBaseUrl` configured, `trustBrowserOri
   Note that `publicBaseUrl` is **only honoured when its authority matches the request Host** (to prevent an open redirect). When Host has already been rewritten to loopback the two do not match, so **`publicBaseUrl` cannot rescue this case either** — you must use the first option. This is an easy misconfiguration, hence documenting it here.
 
   You also need `--trusted-host <public host:port>`, otherwise a desktop browser hitting `/api` directly gets 403 (see "Known limits").
+### D. The three OIDC redirect paths, measured end-to-end (0.6.6)
+
+Using a real IdP (HTTPS with a self-signed CA), a real reverse proxy (both Host-rewriting
+modes) and a real dsh instance, the full round trip — "start authorization → IdP →
+callback → token exchange → local session → back to the app" — was run end to end.
+All 56 assertions pass. The table below lists the measured values for `redirect_uri`
+and for the post-callback redirect target:
+
+| Path | Key config | redirect_uri seen by the IdP | Target after callback |
+| --- | --- | --- | --- |
+| Fixed path | `redirectBase=http://127.0.0.1:14080` | `http://127.0.0.1:14080/dsh-webui-oauth/oidc/callback` | `http://127.0.0.1:14080/?…&oidcbound=1` ✅ |
+| Fixed path + hostile origin | same, with `base=https://evil.example.com` | still the configured 14080 ✅ (not swayed) | same ✅ |
+| Reverse proxy (Host rewritten + XFH) | same, via 14080 | the configured 14080 ✅ | 14080 (the browser-side address) ✅ |
+| Reverse proxy (original Host kept) | same, via 14081 | the configured 14080 ✅ | 14080, **never the internal 13081** ✅ |
+| Browser-dynamic | `redirectBase` empty + `trustBrowserOrigin=true` | the origin reported by the browser ✅ | back to that origin ✅ |
+| Dynamic + pass-through proxy | same, via 14081 | `http://127.0.0.1:14081/dsh-webui-oauth/oidc/callback` ✅ | `http://127.0.0.1:14081/?…` (session preserved) ✅ |
+| Dynamic but switch off | `trustBrowserOrigin=false`, no `redirectBase` | **no authorization started**, `oidc-base-unresolvable` ✅ | — |
+
+Rejected inputs (no authorization started, no injection):
+`javascript:alert(1)`, origins carrying a path / query / hash / userinfo, and
+CRLF-injection attempts such as `https://evil.test/\r\nX-Injected: 1`.
+
+**Why the bind path sends no session cookie**: on completion the bind flow only clears
+the one-shot state cookie. That is deliberate — binding happens *after* the administrator
+is already signed in and reuses the same session, so re-issuing one would rotate
+credentials for no reason. The login path is the opposite and must send a new session
+(the response carries two `Set-Cookie` headers). This difference is locked down by tests.
+
+Reproduce with `test/oidc-redirect-matrix.test.mjs` (dependency-free unit regression,
+wired into `npm test`).
 
 ## Known limits
 

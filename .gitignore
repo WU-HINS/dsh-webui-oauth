@@ -17,6 +17,9 @@ Thumbs.db
 # 本地工作状态（agent 记忆、会话归档等），不随仓库分发
 .workbuddy/
 
+# 本地验证实验区（含测试 IdP、反向代理、临时凭据与审计日志）——切勿提交
+.lab/
+
 # npm 本地缓存（仅用于受限环境下打包检查）
 .npm-cache/
 node_modules/
