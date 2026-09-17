@@ -4,13 +4,17 @@
  * 'dsh-webui-oauth'，client-modules 找不到对应注册 → 插件面板加载失败。
  */
 import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 let pass = 0, fail = 0
-const eq = (n, c, x) => { if (c) { pass++; console.log('  ok   ' + n) } else { fail++; console.log('  FAIL ' + n + ' ' + (x ?? '')) } }
+const eq = (n, c, x) => { if (c) { pass++; console.log('  ok   ' + n) } else { fail++; console.log('  FAIL ' + n + '  ' + (x === undefined ? '' : x)) } }
 
-const client = readFileSync('/workspace/dsh-webui-auth/lib/client.js', 'utf8')
-const pkg = JSON.parse(readFileSync('/workspace/dsh-webui-auth/package.json', 'utf8'))
-const patch = readFileSync('/workspace/dsh-webui-auth/cordis.patch.yml', 'utf8')
+// 相对测试文件定位仓库根，绝不硬编码绝对路径——否则换个机器/CI 必挂。
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const client = readFileSync(join(root, 'lib/client.js'), 'utf8')
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const patch = readFileSync(join(root, 'cordis.patch.yml'), 'utf8')
 
 const m = /__ModuleLoader__\.load\(\{\s*id:\s*'([^']+)'/.exec(client)
 eq('client.js 有 __ModuleLoader__.load 调用', m !== null)
