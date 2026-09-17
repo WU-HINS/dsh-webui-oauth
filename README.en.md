@@ -4,19 +4,69 @@ English | [中文](README.md)
 
 A persistent WebUI authentication plugin for DeepSeek Harness. Once you create an account/password in **Settings → 身份认证 (Authentication)** or via the first-run login page, **unauthenticated browsers cannot load any WebUI resource, call any API, or open any realtime connection** — authentication is enforced at the HTTP/transport layer and cannot be bypassed through browser devtools. Both local password accounts and **OIDC/SSO single sign-on** are supported.
 
-> **This plugin is an enhanced replacement for [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth)** (adding OIDC SSO and more). If both are installed, **this plugin disables the original at startup** (see "Relationship to the original"), so you never end up with two gates; credentials and the data directory keep the original location, so **existing accounts and sessions keep working**.
+> **This plugin is an enhanced replacement for [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth)** (adding OIDC SSO and more). **After installing it you must remove the original from your profile's bundle list** (see "Relationship to the original") — running both at once makes them fight over the same routes, and no coexistence mode works; on detecting that conflict this plugin **refuses to boot** (dsh exits with code 1 and prints the fix) rather than degrading. Credentials and the data directory keep the original location, so **existing accounts and sessions keep working**.
 
-## Relationship to the original (auto-displacement)
+## Relationship to the original (pick one — never enable both)
 
-The original `dsh-webui-auth` and this plugin both enforce authentication by wrapping `webServer` routes at runtime. If both gates stay alive, every request is checked twice against two independent session stores, and the two logins do not recognise each other (logging in through one gate still leaves the other returning 302/401) — the visible symptom is a login page that keeps redirecting.
+The original `dsh-webui-auth` and this plugin both claim **the same set of routes** through `ctx.webServer.register()` (the `""`, `/api` and `/plugins` prefixes plus the `/api/remote.mux` upgrade route). The webServer route table is **first-come-first-served**: registering the same `(kind, path)` twice throws `duplicate ... route`, and route entries **carry no owner information** (only `{kind, path, handler}`), so there is no way to tell afterwards who registered a given route.
 
-So at startup (before installing its own gate) this plugin walks the cordis plugin registry, finds any loaded original by plugin name, and **disposes all of its fibers**. The original is itself reversible: disposing it undoes its route wrapping and endpoint registration, after which this plugin owns the whole gate. The host log shows:
+**Runtime displacement is therefore architecturally impossible.** This plugin used to try two variants; both were falsified on an isolated instance:
+
+| Attempted approach | Measured result |
+| --- | --- |
+| Runtime `dispose` of the original's fibers | The original's `apply` hits `INACTIVE_EFFECT`; **the whole dsh process fails to start** |
+| Runtime `disable` of the original's entry | The original's routes are already registered, so this plugin's registration hits `duplicate prefix route`; **the process fails to start** |
+| Do nothing, let both coexist | The process starts, but **only the original takes effect** — every endpoint of this plugin 404s (silent failure, the hardest kind to diagnose) |
+| **Remove the original at config level** (recommended) | Starts normally; this plugin is fully in effect |
+| **Install only this plugin** (recommended) | Starts normally; this plugin is fully in effect |
+
+The first two are load-order independent (both orders reproduce): whoever registers first wins, and the latecomer throws and is rejected by the boot audit.
+
+**The right fix**: after installing this plugin, drop the original from the profile's dependencies and bundle list. Edit `$DSH_HOME/profiles/<name>/package.json`:
+
+```jsonc
+{
+  "dependencies": {
+    // remove this line:
+    // "dsh-webui-auth": "^0.3.5",
+    "dsh-webui-oauth": "^0.4.4"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        // remove this line:
+        // "dsh-webui-auth",
+        "dsh-webui-oauth"
+      ]
+    }
+  }
+}
+```
+
+To keep the dependency but merely mask the original, disable its entry by id in the profile's `cordis.patch.yml`:
+
+```yaml
+- id: dsh-webui-auth
+  disabled: true
+```
+
+**A double install fails the boot outright (fail-fast).** If the original is still enabled, this plugin **throws at the very start of `apply`**, so dsh exits with code 1 and prints a single readable fix instruction to stderr:
 
 ```
-[dsh-webui-oauth] displaced original plugin(s): dsh-webui-auth — this plugin takes over the auth gate; credentials/data directory are shared.
+[dsh-webui-oauth] 检测到原版 dsh-webui-auth 同时启用，拒绝启动。两者抢占同一批路由（webServer 路由表先到先得），
+实测无法共存：本插件的登录页与闸门会完全失效（端点 404），或直接导致启动失败。
+修复：从 profile 的 dsh.profile.bundles 与 dependencies 中移除 dsh-webui-auth，
+或在其补丁层写 disabled: true，然后重启。
 ```
 
-- **Matching is by plugin name only** — no other plugin is touched; if the original is absent, startup continues silently.
+**Why refuse to boot instead of degrading**: measurements show there is no usable coexistence mode (see the last two rows of the table above). "The process starts but gate ownership is undefined" is the most dangerous shape of all — the operator believes the door is locked while every endpoint of this plugin 404s. Rather than serve traffic in a half-broken state, this plugin blocks the problem at startup and states the fix.
+
+(Cordis's default logger only fills an in-memory buffer and never reaches stdout/stderr, hence the explicit stderr write — that line is the only readable clue for the failed boot, so `docker logs` / `journalctl` must show it.)
+
+- **Matching is by plugin name only** — no other plugin is touched; when the original is absent this plugin stays completely silent.
+- **It never mutates anyone else's lifecycle**: this plugin does not `dispose` or `disable` any sibling entry or fiber.
 - **Data carries over seamlessly**: the data directory (`.dsh-webui-auth/`) and credentials file (`dsh-webui-auth.json`) **deliberately keep their original names**, so accounts created by the original work without migration.
 - **Adopting the original's data directory**: when this plugin has no credentials of its own yet, it looks for an original data directory that already holds credentials and **reuses it directly** (not copies — copying would produce two credential sets that diverge as soon as one side changes the password):
   1. the sibling directory `../dsh-webui-auth/` (the usual case for source / `link:` installs);
@@ -51,7 +101,7 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
   - `trustBrowserOrigin` defaults to `true` when omitted (legacy behavior); an explicit `false` makes both sites **ignore** the browser-influenced origin and use `publicBaseUrl`. With no `publicBaseUrl` either, the token redirect falls back to the request Host / loopback, and OIDC fails closed with an error.
   - The old `oidc.trustBrowserOrigin` is still accepted: when the settings section does not set the switch explicitly, it is used as the fallback, so existing deployments migrate smoothly.
   - **Host-rewriting reverse proxies**: when the proxy rewrites `Host` to a loopback address (`127.0.0.1:3080`, `::1`, `localhost`, `0.0.0.0`) and sends nothing else, the plugin **cannot** recover the browser-side address from the request, so it treats the address as proxy-rewritten and uses the configured `publicBaseUrl` directly (the legacy "declare the public address in settings.yaml" advice was ineffective in that shape, because `publicBaseUrl` was only trusted on an exact Host match). If the proxy can send the original host, `X-Forwarded-Host` (or RFC 7239 `Forwarded: host=`) is preferred over the request Host for building the redirect.
-- **Optional OIDC SSO (0.4.0)**: standards-based authorization-code + PKCE with a **confidential client (client_secret required)**, security-benchmarked against Logto. Once configured, the login page shows an "SSO single sign-on" button; after IdP authentication the plugin creates a local session keyed by the IdP `sub` (reusing the session TTL and persistence). The **redirect_uri base is set by `oidc.redirectBase`**; by default the browser is trusted (it trusts the front-end `location.origin` — under a host-rewriting reverse proxy the browser's public address is correct), ****constrained by the unifed switch above****; when disabled only the configured `redirectBase` is used; if neither is available it fails closed with an error. Supports RSA/EC/EdDSA-signed id_token validation (JWKS + iss/aud/exp/iat/nbf/nonce checks) and simple local logout (clears the local session only, no IdP SLO).
+- **Optional OIDC SSO (0.4.0)**: standards-based authorization-code + PKCE with a **confidential client (client_secret required)**, security-benchmarked against Logto. Once configured, the login page shows an "SSO single sign-on" button; after IdP authentication the plugin creates a local session keyed by the IdP `sub` (reusing the session TTL and persistence). The **redirect_uri base is set by `oidc.redirectBase`**; by default the browser is trusted (it trusts the front-end `location.origin` — under a host-rewriting reverse proxy the browser's public address is correct), ****constrained by the unifed switch above****; when disabled only the configured `redirectBase` is used; if neither is available it fails closed with an error. id_token signatures support **RSA (RS256/384/512, PS256/384/512), EC (ES256/384/512) and EdDSA (Ed25519)**, with iss/aud/exp/iat/nbf/nonce and JWKS(kid) validation (see "Signature algorithm support" below). Logout is the simple variant: it clears the local session only.
 - **Scheme-adaptive post-login redirect (0.3.3, fixes #6 / #7)**: after a successful login the plugin sends the browser to the core's token-bearing root URL. Its **authority now comes from the request Host** (no longer hardcoded to `127.0.0.1`) and its **scheme follows the protocol the request actually used**, resolved in this order: ① the operator's explicit `remote-web-ui.publicBaseUrl` (**trusted only when its host/port matches the incoming Host** — otherwise a LAN direct hit would be redirected to the public address and lose the freshly issued session cookie to a cross-origin hop); ② the standard proxies headers `X-Forwarded-Proto` (leftmost value) or RFC 7239 `Forwarded: proto=`; ③ a TLS-terminating socket (`socket.encrypted`); ④ fallback `http`. It deliberately does **not** guess "non-IP hostname ⇒ https", which would turn plain-http intranet access (`http://nas.local:3080`) into a dead https link. The login page adds a one-way client-side fallback: an https page receiving a **same-origin** `http://` redirect upgrades it to `https://` (never downgrades, never rewrites another origin).
 
 Sessions are **server-side and persisted to disk** (`sessions.jsonl`, survive a DSH restart, expire server-side), carried by an `HttpOnly; SameSite=Lax` cookie (`dsh_wua_session`) that JS cannot read; changing the password **revokes every other session**.
@@ -185,12 +235,115 @@ Both the login page and the "Settings → 身份认证 (Authentication)" setting
 - The login/setup endpoints are intentionally public (the entry point of authentication): `/dsh-webui-oauth/login` and `/dsh-webui-oauth/setup` (the latter protected by the setup token).
 - **OIDC SSO**: authorization-code + PKCE + client_secret (confidential client, no public-client PKCE); state guards CSRF, nonce guards replay, redirect_uri is exact-matched (base + fixed path), id_token is JWKS-verified with iss/aud/exp/iat/nbf/nonce checks, and only HTTPS endpoints are accepted. Only the `sanitizeSub`-filtered `sub` is recorded in the audit log. The OIDC client config (including the secret) lives in `dsh-webui-oauth.json` in the data directory, kept apart from the account credentials.
 
+## Signature algorithm support (id_token verification)
+
+| Family | Algorithms | JWKS `kty` | Status |
+| --- | --- | --- | --- |
+| RSA | RS256 / RS384 / RS512 | `RSA` | ✅ |
+| RSA-PSS | PS256 / PS384 / PS512 | `RSA` | ✅ |
+| **ECDSA** | **ES256** (P-256) / **ES384** (P-384) / **ES512** (P-521) | `EC` | ✅ |
+| EdDSA | Ed25519 | `OKP` | ✅ |
+
+**EC support is fully working, not merely documented.** All three curves are verified with real signatures:
+
+- **Unit level** (`test/oidc-ec.test.mjs`, 16 assertions): each curve generates a native key and signs for real → verification passes; a tampered payload or a foreign-key forgery → rejected; JWKS lookup by `kid` selects the EC key; and it still works when the JWKS **omits `alg`** (some IdPs do).
+- **End to end**: a purpose-built IdP signed id_tokens with ES256 / ES384 / ES512 respectively, each driven through the full authorization-code + PKCE flow — all three logged in successfully (audit `oidc_login_success`).
+
+**Implementation note**: an ECDSA JWT signature is JOSE raw `R||S` (ieee-p1363), whereas Node's `crypto.verify` **parses DER by default**. Without an explicit `dsaEncoding: 'ieee-p1363'`, ES384/ES512 simply fail to verify, while ES256's shorter curve means the occasional mis-parse can appear to pass — an extremely hard bug to chase. This plugin handles that path explicitly and covers it with regression tests.
+
+**Algorithm-confusion protection (hardened in 0.5.0)**:
+
+1. **The verification algorithm comes only from the token header; the JWKS `alg` is merely a consistency constraint.** The earlier code read `(jwk.alg || header.alg)`, and since virtually every IdP writes `alg` in its JWKS, that let `jwk.alg` override `header.alg` and made the header field inert. Measured consequence: a token genuinely signed with a P-256 key still verified after relabelling the header `ES384`/`ES512` — "claims ES512, is actually P-256". It now takes `header.alg` as the single source of truth and rejects any conflict with `jwk.alg`.
+2. **Algorithm names go through an explicit allowlist** (no more `startsWith` prefix matching). Previously fabricated names like `ES999`/`RS999` could select a key of the matching `kty` — blocked today by an upper-layer allowlist, but that meant resting security on "another function happens to catch it".
+3. **`kty` is still checked after a `kid` hit**, a mismatch is rejected, and there is **no fallback to "pick any key"** (a named `kid` with no match returns `null` → `no-signing-key`).
+4. **JWKS `use` / `key_ops` are validated**: an encryption-only key (`use=enc` or `key_ops=[encrypt]`) is never selected for verification.
+5. **`alg=none` and `HS*` are rejected** (including a real forgery attempt that uses a public key as the HMAC secret).
+
+Each item has regression tests; the cases for the first two are confirmed to fail reliably (7 FAILs) against the pre-fix build, so they are not vacuous assertions.
+
+**Choosing an algorithm**: IdPs default to RS256 most of the time; if yours supports EC, ES256 produces shorter signatures and verifies faster, which suits mobile clients and high-throughput deployments.
+
+## End-to-end test results (isolated instance)
+
+Measured on an isolated dsh instance (its own `$DSH_HOME` and profile, fully separate from the production image) running this repository's plugin, against a **purpose-built minimal OIDC provider** (discovery / jwks / authorize / token, RS256 signing with PKCE S256 verification).
+
+### A. Local account flow
+
+| Step | Request | Measured result |
+| --- | --- | --- |
+| Unauthenticated `/` | GET | **302 → /dsh-webui-oauth/login** (gate active) |
+| Unauthenticated `/api` | GET | **401** |
+| Login page | GET `/dsh-webui-oauth/login` | **200** (the only public page) |
+| Wrong setup token | POST `/setup` | `{"ok":false,"error":"setup-token-required"}` |
+| Weak password | POST `/setup` | `{"ok":false,"error":"weak-password","reason":"length"}` |
+| Correct setup token | POST `/setup` | `{"ok":true}` + `dsh_wua_session` cookie (HttpOnly; SameSite=Lax; Max-Age=43200) |
+| Repeat setup | POST `/setup` | `{"ok":false,"error":"already-configured"}` |
+| Wrong password | POST `/login` | `{"ok":false,"error":"invalid"}` |
+| Correct password | POST `/login` | `{"ok":true}` + session cookie |
+
+**The two-cookie handoff (important)**: with a plugin session, visiting `/` returns a 302 to the core's launch-token URL (`/?token=…`) so the browser completes the core's own `dsh-auth-*` cookie exchange. Measured:
+
+- `/api` with only the plugin cookie → **401** (the core has not claimed this browser yet);
+- `/api` after the token exchange → **404** (authenticated; the path simply does not exist).
+
+The plugin gate and the core's BrowserAuth are **two independent doors** — both are required. This is by design, not a fault.
+
+### B. OIDC / SSO flow
+
+Run end-to-end against a minimal IdP (`https://127.0.0.1:14443`, self-signed CA):
+
+1. `GET /dsh-webui-oauth/oidc/login?base=<browser origin>` → **302** to the IdP `/authorize`, carrying `code_challenge` + `code_challenge_method=S256`, and setting the `dsh_wua_oidc_state` cookie (HttpOnly, 600s);
+2. the IdP validates client_id / response_type / PKCE, then **302**s back to `redirect_uri?code=…&state=…`;
+3. `GET /dsh-webui-oauth/oidc/callback` → the plugin exchanges the code with its `code_verifier`, verifies the id_token signature → **200** plus a session cookie, clearing the state cookie;
+4. the audit log records `oidc_login_success` with the IdP `sub` (measured: `lab-user-001`).
+
+The IdP log confirms the full round trip: `discovery → jwks → authorize (issued code) → token (issued id_token)`.
+
+Security properties verified (all correctly rejected):
+
+| Attack | Measured |
+| --- | --- |
+| Mismatched state | `{"ok":false,"error":"oidc-invalid-state"}` |
+| Missing state cookie (login CSRF / session fixation) | `{"ok":false,"error":"oidc-invalid-state"}` |
+| Authorization-code replay | `{"ok":false,"error":"oidc-invalid-state"}` |
+
+### C. Redirects when a reverse proxy rewrites Host (the important part)
+
+Preconditions: **no** `remote-web-ui.publicBaseUrl` configured, `trustBrowserOrigin` at its default `true`. Assume the browser really talks to `http://127.0.0.1:14080` while the proxy rewrites Host to the loopback `127.0.0.1:13081` (Caddy's default behaviour).
+
+| Scenario | Redirect the plugin emits | Correct? |
+| --- | --- | --- |
+| 1. Direct (Host=13081) | `http://127.0.0.1:13081/?token=…` | ✅ |
+| 2. Host rewritten **+ X-Forwarded-Host=14080** | `http://127.0.0.1:14080/?token=…` | ✅ |
+| 3. Host rewritten + XFH=public.example:8443 + X-Forwarded-Proto=https | `https://dsh.example.com:8443/?token=…` | ✅ |
+| 4. Host rewritten **and no XFH** | `http://127.0.0.1:13081/?token=…` | ❌ points at the internal port |
+
+**Conclusion**: when a proxy rewrites Host and does **not** forward the original host header, no correct redirect can be derived without a configured `publicBaseUrl` — the server has no browser-side address at all, and guessing would amount to an open redirect. The browser is sent to `127.0.0.1:13081`; if that port is internal/unexposed the symptom is "login succeeds but the page will not open".
+
+**Two fixes, pick either**:
+
+- Have the proxy forward the original host header (recommended, least configuration):
+  ```nginx
+  proxy_set_header X-Forwarded-Host $host;      # or $http_host to include the port
+  proxy_set_header X-Forwarded-Proto $scheme;
+  ```
+  Caddy forwards `X-Forwarded-Host` by default; if you preserve Host instead (e.g. a `DSH_PRESERVE_HOST`-style switch), the case collapses into "direct" and is equally correct.
+- Or declare the public address explicitly in `settings.yaml`:
+  ```yaml
+  remote-web-ui:
+    publicBaseUrl: 'https://dsh.example.com:8443'
+  ```
+  Note that `publicBaseUrl` is **only honoured when its authority matches the request Host** (to prevent an open redirect). When Host has already been rewritten to loopback the two do not match, so **`publicBaseUrl` cannot rescue this case either** — you must use the first option. This is an easy misconfiguration, hence documenting it here.
+
+  You also need `--trusted-host <public host:port>`, otherwise a desktop browser hitting `/api` directly gets 403 (see "Known limits").
+
 ## Known limits
 
 - **Inherent runtime-wrapping window**: between a route-object replacement (service hot-reload) and the next rescan (≤10s) there is an unprotected window; the fail-closed check on enabling covers the "initially exposed" case, so this window only affects hot-reload during runtime.
 - **WebSocket and `trustedHosts`**: in reverse-proxy / LAN deployments (non-loopback Host), WS downlinks need the public hostname added to `client-connection.trustedHosts` in the DSH config (see "Architecture").
 - **Proxy on a different host**: if the reverse proxy is not on the same machine as DSH (non-loopback peer), the proxy headers are not trusted and rate limiting aggregates per proxy IP (degrades to a global bucket).
 - **HTTPS proxy that sends no protocol header**: the post-login redirect scheme depends on ① `remote-web-ui.publicBaseUrl` or ② an `X-Forwarded-Proto` / `Forwarded` header from the proxy. With neither, it can only fall back to `http` (the browser then handshakes against the TLS port and the page looks frozen after clicking Login). Pick one: declare the public address in `settings.yaml`, or make the proxy send `proxy_set_header X-Forwarded-Proto $scheme;`. Note `publicBaseUrl` only applies when it matches the request Host, which is what keeps LAN direct access from being rewritten to the public address.
+- **Proxy rewrites Host without forwarding the original host header**: the server then has no browser-side address at all, so without a configured `publicBaseUrl` no correct redirect is possible (it points at the internal upstream port); and `publicBaseUrl` does not apply either, because its authority no longer matches. **The only workable fix is to have the proxy send `X-Forwarded-Host`** (Caddy does by default) or to preserve the original Host. See the measured table in section C of "End-to-end test results".
 - **`--trusted-host` is not optional**: after desktop password login, requests that hit `/api` directly depend on `--trusted-host <public-host:port>`; the remote-web-ui pairing flow (`/remote` channel) does not. Dropping the flag makes every `/api` call return 403.
 - **Limits of audit pseudonymization**: the HMAC key lives in the same data directory (0600); a local attacker who can read it can brute-force the IP space — pseudonymization protects against "plaintext IPs at rest", not against an attacker with file access.
 - Sessions live in `sessions.jsonl`: they survive restarts (expiry unchanged); uninstalling/disabling the plugin does not affect credentials.

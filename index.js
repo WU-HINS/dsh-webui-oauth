@@ -982,54 +982,57 @@ function rejectUpgrade401(socket) {
   try { socket.destroy() } catch (e) { /* ignore */ }
 }
 
-// ---------------- 顶掉原版 dsh-webui-auth ----------------
+// ---------------- 与原版 dsh-webui-auth 共存的问题 ----------------
 //
-// 本插件（dsh-webui-oauth）是原版 dsh-webui-auth 的增强替代。两者都通过运行时包装
-// webServer 路由实现认证：同时加载会出现【双闸门】——同一请求被两套会话校验各拦一次，
-// 且两套 /dsh-webui-* 端点并存，登录态互不相认（在一个闸门登录，另一个仍返回 302/401），
-// 表现为「登录后反复跳转」。
+// 本插件（dsh-webui-oauth）是原版 dsh-webui-auth 的增强替代，但【不能】在运行时接管它。
 //
-// 因此这里主动停掉已加载的原版：遍历 cordis 插件注册表，按插件名找到原版 runtime，
-// 逐个 dispose 它的 fiber。卸掉后原版的 ctx.effect 清理函数会执行，其路由包装与
-// 端点注册被完整撤销（原版自身就是可逆设计），随后由本插件接管全部闸门。
+// 原版与本插件都用 ctx.webServer.register() 抢占同一批路由（前缀 ""、/api、
+// /plugins，以及 /api/remote.mux 升级路由）。webServer 的路由表是【先到先得】：
+// register() 对同 (kind, path) 直接抛 "duplicate ... route"，而且路由条目里
+// 【不含任何属主信息】——注册进去就只有 path，追不回是谁注册的。
 //
-// 边界：只按【插件名】匹配，不碰任何其他插件；找不到原版时静默继续（正常路径）。
-const DISPLACED_PLUGIN_NAMES = ['dsh-webui-auth']
+// 实测矩阵（隔离 dsh 0.1.5-rc.2 实例，双插件同时进 profile bundles）：
+//   A. 运行时 dispose 原版 fiber  → 原版 apply 撞 INACTIVE_EFFECT，整个进程启动失败
+//   B. 运行时 disable 原版条目    → 原版路由已注册，本插件注册时撞 duplicate route，启动失败
+//   C. 配置层 disabled 原版       → 正常启动（推荐做法）
+//   D. profile 里只装本插件       → 正常启动（推荐做法）
+//   E. 两者都装且都不动对方       → 进程能起，但【只有原版生效】（本插件端点 404）
+//
+// A/B 失败与加载顺序无关（两种顺序都复现）：谁先注册谁赢，晚到者抛异常并被
+// boot 的启动审计判为失败。E 更隐蔽：本插件 apply 确实执行了，但它的路由
+// 注册全部落空，表现成"装上了却完全不生效"。
+//
+// 结论：运行时接管在架构上不可行，本插件【不再】尝试停用原版。
+// 双装由【配置层】解决（见 README 的迁移说明），运行时只做一件事：
+// 检测到原版也在跑时，把冲突明确报出来，避免"静默失效"这种最坏的形态。
+const ORIGINAL_PLUGIN_NAME = 'dsh-webui-auth'
 
-function displaceOriginalPlugins(ctx, log) {
-  const displaced = []
+/**
+ * 检测原版 dsh-webui-auth 是否也在运行。
+ *
+ * 【为什么必须显式检测】原版与本插件抢同一批路由，先注册者胜。若原版先注册，
+ * 本插件的全部端点会静默落空——进程不报错、日志无异常，但登录页根本不存在。
+ * 这种"看起来装好了、实际没生效"的故障最难排查，所以宁可吵一点也要报出来。
+ *
+ * 只断言可证的事实：原版条目是否【启用并加载】。不猜"谁占住了路由"——
+ * webServer 的路由条目只存 {kind,path,handler}，没有属主字段，追不回注册者；
+ * 本插件自己的注册成败则另有精确判据（见 gate.ok()），不需要靠猜。
+ *
+ * @returns {{ loaded: boolean }} loaded=原版条目处于启用状态且已加载。
+ */
+function detectOriginalPlugin(ctx) {
+  const result = { loaded: false }
   try {
-    const registry = ctx.registry
-    if (!registry || typeof registry.values !== 'function') return displaced
-    // 先收集再 dispose：遍历过程中直接删除会破坏迭代。
-    const victims = []
-    for (const runtime of registry.values()) {
-      const rtName = runtime && runtime.name
-      if (typeof rtName === 'string' && DISPLACED_PLUGIN_NAMES.includes(rtName)) {
-        victims.push(runtime)
+    const loader = ctx.get('loader')
+    if (loader && typeof loader.entries === 'function') {
+      for (const entry of loader.entries()) {
+        const n = entry && entry.options && entry.options.name
+        // disabled 的条目不会被加载，不构成冲突。
+        if (n === ORIGINAL_PLUGIN_NAME && !entry.disabled) { result.loaded = true; break }
       }
     }
-    for (const runtime of victims) {
-      // registry.delete(callback) 会 dispose 该插件的全部 fiber；
-      // 用 runtime.callback 作为 key（这正是 map 的键）。
-      const removed = typeof registry.delete === 'function' ? registry.delete(runtime.callback) : undefined
-      const fibers = (removed && removed.fibers) || runtime.fibers
-      // 双保险：即使 registry.delete 未生效，也逐个 dispose 掉 fiber。
-      if (fibers && typeof fibers[Symbol.iterator] === 'function') {
-        for (const fiber of fibers) {
-          try {
-            if (fiber && typeof fiber.dispose === 'function') fiber.dispose()
-          } catch (e) { /* 单个 fiber 清理失败不应阻断接管 */ }
-        }
-      }
-      displaced.push(runtime.name)
-    }
-  } catch (e) {
-    // 注册表结构变化时不能让接管流程崩溃：退化为「不做替换」，
-    // 由调用方记录警告，运维可从日志发现双装。
-    try { log('displace failed: ' + (e && e.message ? e.message : String(e))) } catch (err) { /* ignore */ }
-  }
-  return displaced
+  } catch (e) { /* 结构变化：视为未检测到 */ }
+  return result
 }
 
 /**
@@ -1554,8 +1557,21 @@ export function verifyJwtSignature(jwt, jwk) {
     const data = Buffer.from(parts[0] + '.' + parts[1], 'utf8')
     const sig = b64urlDecode(parts[2])
     const header = parseJwt(jwt) && parseJwt(jwt).header
-    const alg = (jwk && jwk.alg) || (header && header.alg)
-    if (!alg) return false
+    if (!header) return false
+    // 验签算法【只能】由 token 头部决定，且 JWKS 若声明了 alg 就必须与之一致。
+    //
+    // 早先这里写成 (jwk && jwk.alg) || (header && header.alg)：由于几乎每个 IdP 都会在
+    // JWKS 里写 alg，等价于让 jwk.alg 覆盖 header.alg，header.alg 形同虚设。后果是
+    // 【声明与实际不符的 token 会被接受】：攻击者拿 P-256 密钥（kid 命中）真实签名，
+    // 只需把 header 写成 ES512，就得到一个"自称 ES512、实为 P-256"的 token 并通过验证。
+    // 实测：同一条 P-256/sha256 签名，header 写 ES256/ES384/ES512 三者全部接受。
+    // 这架空的正是 algMatchesKty/findJwk 想建立的算法混淆防护（只是从 kty 维度漏到
+    // 曲线与哈希维度），下游任何依据 header.alg 的分级/审计都会被欺骗。
+    //
+    // 修法：以 header.alg 为唯一真源；jwk.alg 只作【一致性约束】，冲突即拒。
+    const alg = header.alg
+    if (typeof alg !== 'string' || !alg) return false
+    if (jwk && typeof jwk.alg === 'string' && jwk.alg && jwk.alg !== alg) return false
     let jwkKey = jwk
     if (jwk && jwk.kty === 'EC') {
       jwkKey = { kty: 'EC', crv: jwk.crv, x: jwk.x, y: jwk.y }
@@ -1571,7 +1587,10 @@ export function verifyJwtSignature(jwt, jwk) {
     const digest = jwtAlgToDigest(alg)
     if (!digest) return false
     // ECDSA JWT 签名采用 JOSE/ieee-p1363 原始 R||S 格式，而 crypto.verify 默认期望 DER——
-    // 须显式指定 dsaEncoding，否则 ES384/ES512 会验签失败（ES256 因曲线小偶尔误中）。
+    // 须显式指定 dsaEncoding，否则三条曲线都会验签失败。
+    // 实测：用 DER 模式去验 raw 签名，P-256 与 P-521 各 300 次全部拒绝（0 次误中），
+    // 三曲线的 raw(R||S) 长度分别为 64/96/132 字节。原始注释里"ES256 因曲线小偶尔误中"
+    // 的说法不成立，已按实测更正，免得后人据此误判风险。
     if (alg.startsWith('ES')) {
       return cryptoVerify(digest, data, { key, dsaEncoding: 'ieee-p1363' }, sig)
     }
@@ -1585,31 +1604,38 @@ export function verifyJwtSignature(jwt, jwk) {
 // 命中 kid 后仍校验 alg 与 key 类型一致：攻击者可用 RSA key 的 kid 配 ES256 头，
 // 若直接采信会把"该用哪种算法验签"的决定权交给 token 本身（算法混淆的温床）。
 function algMatchesKty(alg, kty) {
-  if (alg === 'EdDSA') return kty === 'OKP'
-  if (alg.startsWith('RS') || alg.startsWith('PS')) return kty === 'RSA'
-  if (alg.startsWith('ES')) return kty === 'EC'
-  return false
+  // 显式白名单，而不是 startsWith 前缀匹配。
+  //
+  // 前缀匹配会把编造的算法名一并放行：实测 alg='ES999' / 'RS999' 都能命中对应 kty 的
+  // key（'Ed999' 因只比对全等才没中）。今天 validateIdToken 的 jwtAlgToDigest 白名单会
+  // 先拦掉这些名字，所以尚不可利用；但 findJwk/verifyJwtSignature 是导出 API，任何新
+  // 调用方漏掉那层白名单就会直接踩中——安全性不该依赖"另一个函数恰好兜底"。
+  const EXPECTED = {
+    ES256: 'EC', ES384: 'EC', ES512: 'EC',
+    RS256: 'RSA', RS384: 'RSA', RS512: 'RSA',
+    PS256: 'RSA', PS384: 'RSA', PS512: 'RSA',
+    EdDSA: 'OKP',
+  }
+  return EXPECTED[alg] === kty
 }
 export function findJwk(jwks, header) {
   if (!jwks || !Array.isArray(jwks.keys) || !header) return null
   const alg = typeof header.alg === 'string' ? header.alg : ''
   if (!alg) return null // 无 alg 一律拒绝，不做猜测
-  const usable = (k) => !!k && typeof k === 'object' && algMatchesKty(alg, k.kty)
+  // use/key_ops 一并校验：JWKS 混放签名与加密密钥时，加密专用 key 不该被选中验签。
+  const usable = (k) => !!k && typeof k === 'object'
+    && algMatchesKty(alg, k.kty)
+    && (k.use === undefined || k.use === 'sig')
+    && (!Array.isArray(k.key_ops) || k.key_ops.includes('verify'))
   if (header.kid) {
     const hit = jwks.keys.find((k) => usable(k) && k.kid === header.kid)
     if (hit) return hit
     return null // 指定了 kid 却无匹配（或类型不符）：不再退化为"随便挑一把"
   }
-  if (alg.startsWith('RS') || alg.startsWith('PS')) {
-    return jwks.keys.find((k) => usable(k)) || null
-  }
-  if (alg.startsWith('ES')) {
-    return jwks.keys.find((k) => usable(k)) || null
-  }
-  if (alg === 'EdDSA') {
-    return jwks.keys.find((k) => usable(k)) || null
-  }
-  return null
+  // 三个分支体原本完全相同（等价于死代码）；alg 的合法性已由 algMatchesKty 的
+  // 白名单把关，这里只需在匹配 kty 的 key 中取首枚。
+  if (!algMatchesKty(alg, 'EC') && !algMatchesKty(alg, 'RSA') && !algMatchesKty(alg, 'OKP')) return null
+  return jwks.keys.find((k) => usable(k)) || null
 }
 
 // 验证 id_token 的声明与签名。返回 { ok, error, payload }。
@@ -1801,14 +1827,28 @@ function makeOidcStateStore(opts) {
 }
 
 export async function apply(ctx) {
-  // 顶掉原版 dsh-webui-auth（若已加载）：必须在安装本插件闸门之前完成，
-  // 否则会出现两套闸门并存的窗口。
-  const displaced = displaceOriginalPlugins(ctx, (m) => {
-    try { ctx.logger.warn('[dsh-webui-oauth] ' + m) } catch (e) { /* ignore */ }
-  })
-  if (displaced.length > 0) {
-    ctx.logger.info('[dsh-webui-oauth] displaced original plugin(s): ' + displaced.join(', ')
-      + ' — this plugin takes over the auth gate; credentials/data directory are shared.')
+  // 双装检测：本插件【不】在运行时接管原版（原因见上方长注释与实测矩阵）。
+  // 检测放在 apply 最前，且【直接抛错】终止加载，而不是只告警：
+  //   实测已证明双装必然产生以下三种坏结果之一（"共存"看着能起，但本插件
+  //   的路由注册全部落空、端点 404）。既然没有一种可用，就不该让进程带着
+  //   "装好了却没生效"的半残状态继续对外服务——那正是最危险的形态：
+  //   运维以为已上锁，实际只要原版那条路还在跑，闸门归属就是不确定的。
+  //   fail-fast 让 dsh 启动即失败并给出明确修复指令，把问题挡在对外服务之前。
+  //
+  // 注意：抛错会让 Cordis 的启动审计（assertEntriesActivated）把本次启动判为
+  // 失败，dsh 进程退出。这是【有意为之】——与其静默降级，不如拒绝启动。
+  const original = detectOriginalPlugin(ctx)
+  if (original.loaded) {
+    const advice = '[dsh-webui-oauth] 检测到原版 ' + ORIGINAL_PLUGIN_NAME + ' 同时启用，拒绝启动。'
+      + '两者抢占同一批路由（webServer 路由表先到先得），实测无法共存：'
+      + '本插件的登录页与闸门会完全失效（端点 404），或直接导致启动失败。'
+      + '修复：从 profile 的 dsh.profile.bundles 与 dependencies 中移除 ' + ORIGINAL_PLUGIN_NAME
+      + '，或在其补丁层写 disabled: true，然后重启。'
+    try { ctx.logger.error(advice) } catch (e) { /* ignore */ }
+    // cordis 的默认 logger 只写内存缓冲区、不落到 stdout/stderr（除非宿主挂了 exporter）。
+    // 这条错误是启动失败的【唯一可读线索】，必须保证 docker logs / journalctl 一定看得到。
+    try { process.stderr.write(advice + '\n') } catch (e) { /* ignore */ }
+    throw new Error(advice)
   }
 
   // H1: 每次启动生成随机 setup token，仅打印到宿主日志。

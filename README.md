@@ -4,19 +4,69 @@
 
 DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认证」或首次访问登录页创建账号密码后，**未认证的浏览器无法加载 WebUI 的任何资源、调用任何接口或建立任何实时连接**——认证在 HTTP/传输层强制执行，不可通过浏览器开发者工具绕过。支持本地账号密码与 **OIDC/SSO 单点登录**两种方式。
 
-> **本插件是 [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth) 的增强替代版**（新增 OIDC SSO 等）。若两者同时安装，**本插件启动时会主动停用原版**（见「与原版的关系」），不会出现双闸门；凭据与数据目录沿用原版位置，**原有账号与登录会话继续有效**。
+> **本插件是 [Yuuz12/dsh-webui-auth](https://github.com/Yuuz12/dsh-webui-auth) 的增强替代版**（新增 OIDC SSO 等）。**安装本插件后必须从 profile 的 bundle 列表里移除原版**（见「与原版的关系」）——两者同时启用会抢占同一批路由，实测无法共存；本插件检测到这种冲突会**直接拒绝启动**（dsh 以退出码 1 结束并打印修复指令），而不是降级运行。凭据与数据目录沿用原版位置，**原有账号与登录会话继续有效**。
 
-## 与原版的关系（自动顶掉原版）
+## 与原版的关系（必须二选一，不能同时启用）
 
-原版 `dsh-webui-auth` 与本插件都通过运行时包装 `webServer` 路由实现认证。若两套闸门同时存活，同一请求会被两套会话各校验一次，且登录态互不相认（在一个闸门登录后，另一个仍返回 302/401），表现为「登录后反复跳转」。
+原版 `dsh-webui-auth` 与本插件都用 `ctx.webServer.register()` 抢占**同一批路由**（前缀 `""`、`/api`、`/plugins` 与 `/api/remote.mux` 升级路由）。webServer 的路由表是**先到先得**：对同一 `(kind, path)` 重复注册会直接抛 `duplicate ... route`，而且路由条目里**不含属主信息**（只存 `{kind, path, handler}`），事后无法判断某条路由是谁注册的。
 
-因此本插件在启动时（安装自己的闸门之前）会遍历 cordis 插件注册表，按插件名找到已加载的原版并 **dispose 掉它的全部 fiber**。原版自身是可逆设计，卸载后其路由包装与端点注册会被完整撤销，随后由本插件接管全部闸门。宿主日志会出现：
+**因此运行时接管在架构上不可行**——本插件曾经尝试过两种方式，都被隔离实例证伪：
+
+| 尝试的做法 | 实测结果 |
+| --- | --- |
+| 运行时 `dispose` 原版 fiber | 原版 `apply` 撞 `INACTIVE_EFFECT`，**整个 dsh 进程启动失败** |
+| 运行时 `disable` 原版条目 | 原版路由已注册，本插件注册时撞 `duplicate prefix route`，**进程启动失败** |
+| 什么都不做、两套共存 | 进程能起，但**只有原版生效**，本插件端点全部 404（静默失效，最难排查） |
+| **配置层移除原版**（推荐） | 正常启动，本插件完整生效 |
+| **profile 里只装本插件**（推荐） | 正常启动，本插件完整生效 |
+
+前两种与加载顺序无关（两种顺序都复现）：谁先注册谁赢，晚到者抛异常并被启动审计判为失败。
+
+**正确做法**：安装本插件后，把原版从 profile 的依赖与 bundle 列表里去掉。编辑 `$DSH_HOME/profiles/<名字>/package.json`：
+
+```jsonc
+{
+  "dependencies": {
+    // 删掉这一行：
+    // "dsh-webui-auth": "^0.3.5",
+    "dsh-webui-oauth": "^0.4.4"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        // 删掉这一行：
+        // "dsh-webui-auth",
+        "dsh-webui-oauth"
+      ]
+    }
+  }
+}
+```
+
+不想动依赖、只想临时屏蔽，也可以在 profile 的 `cordis.patch.yml` 里按 id 禁用原版条目：
+
+```yaml
+- id: dsh-webui-auth
+  disabled: true
+```
+
+**双装会直接启动失败（fail-fast）**：若检测到原版仍处于启用状态，本插件在 `apply` 一开始就**抛错拒绝加载**，dsh 进程随即以退出码 1 结束，并在 stderr 打印一行可读的修复指令：
 
 ```
-[dsh-webui-oauth] displaced original plugin(s): dsh-webui-auth — this plugin takes over the auth gate; credentials/data directory are shared.
+[dsh-webui-oauth] 检测到原版 dsh-webui-auth 同时启用，拒绝启动。两者抢占同一批路由（webServer 路由表先到先得），
+实测无法共存：本插件的登录页与闸门会完全失效（端点 404），或直接导致启动失败。
+修复：从 profile 的 dsh.profile.bundles 与 dependencies 中移除 dsh-webui-auth，
+或在其补丁层写 disabled: true，然后重启。
 ```
 
-- **只按插件名匹配**，不会影响任何其他插件；找不到原版时静默继续。
+**为什么是拒绝启动而不是降级运行**：实测已证明双装没有一种可用形态（见上表后两行）。"进程能起但闸门归属不确定"是最危险的形态——运维以为已经上锁，实际本插件的端点全是 404。与其带着半残状态对外服务，不如把问题挡在启动阶段，并给出明确修复指令。
+
+（cordis 默认 logger 只写内存缓冲区、不落 stdout/stderr，所以这里额外直写 stderr 兜底，保证 `docker logs` / `journalctl` 一定看得到这条唯一线索。）
+
+- **只按插件名匹配**，不会影响任何其他插件；未装原版时完全安静。
+- **绝不改动别人的生命周期**：本插件不 `dispose`、不 `disable` 任何兄弟插件的条目或 fiber。
 - **数据无缝衔接**：数据目录（`.dsh-webui-auth/`）与凭据文件（`dsh-webui-auth.json`）**刻意沿用原名**，原版创建的账号无需迁移即可登录。
 - **接管原版数据目录**：当本插件自身尚无凭据时，会依次查找含凭据的原版数据目录并**直接复用**（不是复制——复制会产生两份凭据，改密码只改一边而分叉）：
   1. 同级目录 `../dsh-webui-auth/`（源码 / `link:` 安装最常见）；
@@ -68,7 +118,7 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
   **已知取舍**：本机浏览器直连 `http://127.0.0.1:3080` 也落进第 2 行，于是开关开着也会跳 `publicBaseUrl`。要同时支持本机直连，只能让反代下发 `X-Forwarded-Host`（走第 1 行）。
 - **登录后跳转的协议自适应（0.3.3，修 #6 / #7）**：插件登录成功后要把浏览器引导到核心的带 token 根地址，其 **authority 取自本次请求的 Host**（不再写死 `127.0.0.1`），**scheme 按请求实际协议解析**，优先级：① 操作者显式声明 `remote-web-ui.publicBaseUrl`（**仅当其 host/port 与本次请求 Host 一致时**采信——否则局域网直连会被重定向到公网地址、跨源丢掉刚下发的会话 Cookie）；② 标准代理头 `X-Forwarded-Proto`（取最左值）或 RFC 7239 `Forwarded: proto=`；③ socket 自身是 TLS（插件直接终结 TLS）；④ 兜底 `http`。**刻意不做「非 IP 域名即 https」的猜测**——那会把纯 http 的内网域名访问（`http://nas.local:3080`）打成 https 死链。前端登录页另有一层单向兜底：页面在 https 下收到**同源** `http://` 跳转时自动升级为 `https://`（反向不降级、异源不改写）。
-- **可选 OIDC 单点登录（0.4.0）**：标准 OIDC 授权码 + PKCE（机密客户端，须 `client_secret`），以 Logto 为安全基准。配置后登录页出现「SSO 单点登录」按钮，认证通过后以 IdP 的 `sub` 建立本地会话（沿用会话有效期与持久化）。**redirect_uri 的 base 由 `oidc.redirectBase` 决定；默认交由浏览器处理（采信前端 `location.origin`，反代重写 Host 时浏览器看到的公网地址即正确），受上面统一开关约束；关闭时仅用配置的 `redirectBase`；两者都不可用则 fail-closed 报错。** 支持 RSA/EC/EdDSA 签名的 id_token 验证（JWKS + iss/aud/exp/iat/nbf/nonce 校验），简单版登出（仅清本地会话）。
+- **可选 OIDC 单点登录（0.4.0）**：标准 OIDC 授权码 + PKCE（机密客户端，须 `client_secret`），以 Logto 为安全基准。配置后登录页出现「SSO 单点登录」按钮，认证通过后以 IdP 的 `sub` 建立本地会话（沿用会话有效期与持久化）。**redirect_uri 的 base 由 `oidc.redirectBase` 决定；默认交由浏览器处理（采信前端 `location.origin`，反代重写 Host 时浏览器看到的公网地址即正确），受上面统一开关约束；关闭时仅用配置的 `redirectBase`；两者都不可用则 fail-closed 报错。** id_token 签名支持 **RSA（RS256/384/512、PS256/384/512）、EC（ES256/384/512）、EdDSA（Ed25519）**，配合 iss/aud/exp/iat/nbf/nonce 与 JWKS(kid) 校验（见下节「签名算法支持」）。登出为简单版：仅清本地会话。
 
 会话为**服务端会话，持久化到磁盘**（`sessions.jsonl`，重启 DSH 不掉线，到期自动失效），由 `HttpOnly; SameSite=Lax` Cookie（`dsh_wua_session`）携带，JS 无法读取；修改密码会**吊销所有其他会话**。
 
@@ -94,7 +144,7 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
 
 从 npm registry 拉取，加入依赖并追加到 `dsh.profile.bundles` 列表，插件行随组合包层自动插入。
 
-> 若你此前装的是原版 `github:Yuuz12/dsh-webui-auth`，可以直接改装本仓库——本插件会自动顶掉原版并沿用原数据目录，账号无需重建。
+> 若你此前装的是原版 `github:Yuuz12/dsh-webui-auth`，可以直接改装本仓库并沿用原数据目录，账号无需重建——但**请务必把原版从依赖与 `dsh.profile.bundles` 中移除**（见「与原版的关系」），否则两者抢占同一批路由，本插件无法生效。
 
 ### 方式三：手动（备用）
 
@@ -202,12 +252,115 @@ npx @deepseek-ai/dsh plugin --profile web add dsh-webui-oauth
 - 登录/初始化端点本身公开（认证的必然入口）：`/dsh-webui-oauth/login`、`/dsh-webui-oauth/setup`（后者受 setup token 保护）。
 - **OIDC 单点登录**：authorization_code + PKCE + client_secret（机密客户端，不做纯 PKCE public client）；state 防 CSRF、nonce 防重放、redirect_uri 精确匹配（base + 固定路径）、id_token 经 JWKS 验签并校验 iss/aud/azp/exp/iat/nbf/nonce、仅接受 HTTPS 端点；审计只记录经 `sanitizeSub` 过滤的 `sub`。OIDC 客户端配置（含 secret）存于数据目录的 `dsh-webui-oauth.json`，与账号凭据分离。
 
+## 签名算法支持（id_token 验签）
+
+| 算法族 | 具体算法 | JWKS `kty` | 状态 |
+| --- | --- | --- | --- |
+| RSA | RS256 / RS384 / RS512 | `RSA` | ✅ |
+| RSA-PSS | PS256 / PS384 / PS512 | `RSA` | ✅ |
+| **ECDSA** | **ES256** (P-256) / **ES384** (P-384) / **ES512** (P-521) | `EC` | ✅ |
+| EdDSA | Ed25519 | `OKP` | ✅ |
+
+**EC 是完整可用的，不只是"写在文档里"**。三个曲线均已用真实签名端到端验证：
+
+- **单元级**（`test/oidc-ec.test.mjs`，16 项）：各曲线用 Node 原生生成密钥并真实签名 → 验签通过；篡改 payload、异密钥伪造 → 拒绝；JWKS 按 `kid` 选中 EC key；JWKS **未声明 `alg`** 时同样可用（部分 IdP 会省略该字段）。
+- **端到端**：以自建 IdP 分别用 ES256 / ES384 / ES512 签发 id_token，走完整授权码 + PKCE 流程，三次均登录成功（审计 `oidc_login_success`）。
+
+**实现要点**：ECDSA 的 JWT 签名是 JOSE 原始 `R||S`（ieee-p1363），而 Node 的 `crypto.verify` **默认按 DER 解析**。若不显式传 `dsaEncoding: 'ieee-p1363'`，ES384/ES512 会直接验签失败；ES256 因曲线较短，偶发的错误解析有时"看起来能过"，极难排查。本插件对该路径有明确处理与回归测试兜底。
+
+**算法混淆防护（0.5.0 加固）**：
+
+1. **验签算法只由 token 头部决定，JWKS 的 `alg` 仅作一致性约束**。早期实现写成 `(jwk.alg || header.alg)`，而 IdP 几乎都会在 JWKS 写 `alg`——等于让 `jwk.alg` 覆盖 `header.alg`，`header.alg` 形同虚设。实测后果：用 P-256 密钥真实签名，只把头部改成 `ES384`/`ES512`，token **照样通过验证**（"自称 ES512、实为 P-256"）。现改为以 `header.alg` 为唯一真源，`jwk.alg` 与之冲突即拒。
+2. **算法名走显式白名单**（不再用 `startsWith` 前缀匹配）。此前 `ES999`/`RS999` 这类编造的名字能命中对应 `kty` 的 key——今天被上层白名单挡住，但等于把安全性押在"另一个函数恰好兜底"上。
+3. **`kid` 命中后仍校验 kty 匹配**，不匹配即拒且**不退化为"随便挑一把"**（指定了 kid 却无匹配直接返回 `null` → `no-signing-key`）。
+4. **校验 JWKS 的 `use` / `key_ops`**：`use=enc` 或 `key_ops=[encrypt]` 的加密专用 key 不会被选中验签。
+5. **拒绝 `alg=none` 与 `HS*`**（含"用公钥当 HMAC secret"的真实伪造尝试）。
+
+上述每条都有回归测试；其中前两条的用例已确认能在修复前的版本上稳定失败（7 项 FAIL），不是"恒真断言"。
+
+**选型建议**：IdP 默认多为 RS256；若你的 IdP 支持 EC，ES256 签名更短、验签更快，适合移动端与高并发场景。
+
+## 全流程实测结果（隔离实例）
+
+以下结果来自隔离 dsh 实例（独立 `$DSH_HOME` + 独立 profile，与生产镜像完全隔离），插件为本仓库版本，配合一个**自建的简易 OIDC 平台**（discovery / jwks / authorize / token，RS256 签名 + PKCE S256 校验）实测。
+
+### A. 本地账号流程
+
+| 步骤 | 请求 | 实测结果 |
+| --- | --- | --- |
+| 未认证访问 `/` | GET | **302 → /dsh-webui-oauth/login**（闸门生效） |
+| 未认证访问 `/api` | GET | **401** |
+| 登录页 | GET `/dsh-webui-oauth/login` | **200**（唯一放行的公开页） |
+| 错误 setup token | POST `/setup` | `{"ok":false,"error":"setup-token-required"}` |
+| 弱密码 | POST `/setup` | `{"ok":false,"error":"weak-password","reason":"length"}` |
+| 正确 setup token | POST `/setup` | `{"ok":true}` + 下发 `dsh_wua_session`（HttpOnly; SameSite=Lax; Max-Age=43200） |
+| 重复 setup | POST `/setup` | `{"ok":false,"error":"already-configured"}` |
+| 错误密码登录 | POST `/login` | `{"ok":false,"error":"invalid"}` |
+| 正确密码登录 | POST `/login` | `{"ok":true}` + 会话 Cookie |
+
+**双 Cookie 交接（重要）**：拿到插件会话后访问 `/`，插件会 302 到核心的带 token 根 URL（`/?token=…`），完成核心自己的 `dsh-auth-*` Cookie 交换。实测：
+
+- 只带插件 Cookie 访问 `/api` → **401**（核心仍未认领该浏览器）；
+- 完成 token 交换后再访问 `/api` → **404**（已通过认证，仅是该路径不存在）。
+
+也就是说插件闸门与核心 BrowserAuth 是**两道独立的门**，缺一不可。这是设计行为，不是故障。
+
+### B. OIDC / SSO 流程
+
+用一个自建虚拟 IdP（`https://127.0.0.1:14443`，自签 CA）完整跑通：
+
+1. `GET /dsh-webui-oauth/oidc/login?base=<浏览器origin>` → **302** 到 IdP `/authorize`，参数含 `code_challenge` + `code_challenge_method=S256`，并下发 `dsh_wua_oidc_state` Cookie（HttpOnly，600s）；
+2. IdP 校验 client_id / response_type / PKCE 后 **302** 回 `redirect_uri?code=…&state=…`；
+3. `GET /dsh-webui-oauth/oidc/callback` → 插件用 `code_verifier` 换 token、验签 id_token → **200** + 下发会话 Cookie、清除 state Cookie；
+4. 审计记录 `oidc_login_success`，身份为 IdP 的 `sub`（实测 `lab-user-001`）。
+
+IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code) → token(issued id_token)`。
+
+安全属性同时验证（均被正确拒绝）：
+
+| 攻击 | 实测 |
+| --- | --- |
+| state 不匹配 | `{"ok":false,"error":"oidc-invalid-state"}` |
+| 缺 state Cookie（登录 CSRF / 会话固定） | `{"ok":false,"error":"oidc-invalid-state"}` |
+| 授权码重放 | `{"ok":false,"error":"oidc-invalid-state"}` |
+
+### C. 反代改写 Host 时的跳转（重点）
+
+前提：**未配置** `remote-web-ui.publicBaseUrl`，`trustBrowserOrigin` 为默认 `true`。假设浏览器实际访问 `http://127.0.0.1:14080`，反代把 Host 改写成回环 `127.0.0.1:13081`（Caddy 的默认行为）。
+
+| 场景 | 插件给出的跳转目标 | 是否正确 |
+| --- | --- | --- |
+| 1. 直连（Host=13081） | `http://127.0.0.1:13081/?token=…` | ✅ |
+| 2. Host 被改写 **+ 下发 X-Forwarded-Host=14080** | `http://127.0.0.1:14080/?token=…` | ✅ |
+| 3. Host 被改写 + XFH=公网域名:8443 + X-Forwarded-Proto=https | `https://dsh.example.com:8443/?token=…` | ✅ |
+| 4. Host 被改写 **且不下发 XFH** | `http://127.0.0.1:13081/?token=…` | ❌ 指向内网端口 |
+
+**结论**：Host 被反代改写且**不下发原始主机头**时，未配置 `publicBaseUrl` 无法得到正确跳转——服务端从请求里拿不到任何浏览器侧地址，这不是可以靠推断解决的问题（猜错会变成开放重定向）。此时浏览器会被送到 `127.0.0.1:13081`，若那是内网/未暴露端口，就表现为「登录成功但页面打不开」。
+
+**两种解法，任选其一**：
+
+- 让反代下发原始主机头（推荐，配置最少）：
+  ```nginx
+  proxy_set_header X-Forwarded-Host $host;      # 或 $http_host（含端口）
+  proxy_set_header X-Forwarded-Proto $scheme;
+  ```
+  Caddy 默认就会传 `X-Forwarded-Host`；若用 `DSH_PRESERVE_HOST` 类开关保留 Host，则场景直接退化为「直连」，同样正确。
+- 或在 `settings.yaml` 显式声明对外地址：
+  ```yaml
+  remote-web-ui:
+    publicBaseUrl: 'https://dsh.example.com:8443'
+  ```
+  注意 `publicBaseUrl` **仅在其 authority 与请求 Host 一致时才被采信**（防开放重定向）。Host 已被改写为回环时二者不一致，因此**该场景下 `publicBaseUrl` 也救不了**——必须走上面第一条。这是实测踩到的细节，容易误配。
+
+  另需 `--trusted-host <对外域名:端口>`，否则桌面浏览器直连 `/api` 会 403（见「已知边界」）。
+
 ## 已知边界
 
 - **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。
 - **WS 与 trustedHosts**：反代/局域网（非回环 Host）下，WS 下行需在 dsh 配置 `client-connection.trustedHosts` 中加入对外域名（见「架构」节）。
 - **反代不同机**：若反代与 DSH 不在同一台机器（对端非回环），代理头不被信任，限流将按代理 IP 聚合（退化为全局桶）。
 - **HTTPS 反代且未下发协议头**：登录后跳转的 scheme 依赖 ①`remote-web-ui.publicBaseUrl` 或 ②反代下发的 `X-Forwarded-Proto`/`Forwarded`。两者都没有时只能兜底 `http`（此时 https 端口会握手失败、页面「点了没反应」）。请二选一：在 `settings.yaml` 声明对外地址，或让反代 `proxy_set_header X-Forwarded-Proto $scheme;`。注意 `publicBaseUrl` 仅在与请求 Host 一致时生效，用来避免把局域网直连改写到公网。
+- **反代改写 Host 且不下发原始主机头**：此时服务端拿不到浏览器侧地址，未配置 `publicBaseUrl` 得不到正确跳转（会指向内网 upstream 端口）；而 `publicBaseUrl` 因 authority 不匹配同样不生效。**唯一可行的解法是让反代下发 `X-Forwarded-Host`**（Caddy 默认下发）或保留原始 Host。详见「全流程实测结果」C 节的实测总表。
 - **`--trusted-host` 不能省**：桌面浏览器用密码登录后**直连 `/api`** 的请求依赖 `--trusted-host <对外域名:端口>`；而 remote-web-ui 的配对流（`/remote` 通道）不需要它。删掉该参数会导致 `/api` 全 403。
 - **审计假名化的边界**：HMAC 密钥与审计日志同目录（0600），能读取密钥文件的本地攻击者可对 IP 空间暴力还原；假名化防的是「日志明文落盘」，不是防有文件权限的攻击者。
 - 会话存于数据目录 `sessions.jsonl`：重启后仍生效（到期时间不变）；关闭/卸载插件不影响凭据。
