@@ -70,8 +70,33 @@ eq('畸形拒绝', parseJwt('not.a.jwt'), null)
 
 console.log('\n— validateIdToken（RS256 全链路） —')
 eq('正常通过', validateIdToken(okToken, { issuer: ISSUER, clientId: CLIENT, nonce: 'n1', jwks }).ok, true)
-let r = validateIdToken(okToken.slice(0, -2) + 'aa', { issuer: ISSUER, clientId: CLIENT, nonce: 'n1', jwks })
+// 篡改签名末两位。注意【不能】直接写 slice(0,-2)+'aa'：
+// RS256 签名是 256 字节，base64url 编码后 342 字符 = 2052 bit，而数据只需 2048 bit，
+// 末位字符的【低 4 位是填充位，解码时被丢弃】。因此当末位落在 {A,Q,g,w} 时，
+// "aQ" 与 "aa" 解码出的字节完全一样——签名根本没被改动，验签当然通过。
+// 实测复现率约 2%（200 轮命中 2 次），表现为 CI 上偶发 FAIL 而本地稳定通过。
+// 修法：翻转末位字符，并断言确实改动了字节；否则换一个字符再试。
+function tamperSignature(token) {
+  const parts = token.split('.')
+  const orig = parts[2]
+  const AL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+  const origBytes = Buffer.from(orig, 'base64url')
+  for (let i = 0; i < AL.length; i++) {
+    if (AL[i] === orig.slice(-1)) continue
+    const cand = orig.slice(0, -1) + AL[i]
+    // 必须确认解码后的字节真的变了，否则这个"篡改"是无效的
+    if (!Buffer.from(cand, 'base64url').equals(origBytes)) {
+      return parts[0] + '.' + parts[1] + '.' + cand
+    }
+  }
+  throw new Error('无法构造出有效的坏签名样本')
+}
+let r = validateIdToken(tamperSignature(okToken), { issuer: ISSUER, clientId: CLIENT, nonce: 'n1', jwks })
 eq('坏签名', r.error, 'bad-signature')
+// 锁死这个回归：篡改后的字节必须与原签名不同，否则上面的用例是假阳性
+eq('篡改确实改变了签名字节',
+  Buffer.from(tamperSignature(okToken).split('.')[2], 'base64url')
+    .equals(Buffer.from(okToken.split('.')[2], 'base64url')), false)
 r = validateIdToken(makeJwt({ iss: ISSUER, aud: CLIENT, sub: 'u', exp: NOW + 300, nonce: 'wrong' }), { issuer: ISSUER, clientId: CLIENT, nonce: 'n1', jwks })
 eq('坏 nonce', r.error, 'bad-nonce')
 r = validateIdToken(makeJwt({ iss: 'https://evil.com', aud: CLIENT, sub: 'u', exp: NOW + 300 }), { issuer: ISSUER, clientId: CLIENT, jwks })
