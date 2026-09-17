@@ -397,8 +397,10 @@ console.log('\n— 5. 匹配的 sub 可以登录 —')
   const cb = makeRes()
   await routes.get('/dsh-webui-oauth/oidc/callback').handler(
     makeReq('/dsh-webui-oauth/oidc/callback?' + back.searchParams.toString(), { cookie: 'dsh_wua_oidc_state=' + state }), cb)
-  const p = JSON.parse(cb.body || '{}')
-  eq('绑定身份登录成功', p.ok === true, cb.body)
+  // 登录成功也必须是 302 回应用（同绑定）：回调时页面上没有我们的 JS 在跑，
+  // 返回 {"ok":true,"redirect":...} 会让浏览器停在 JSON 上。
+  eq('绑定身份登录成功（302 回应用）', cb.status === 302, String(cb.status))
+  eq('回跳目标可解析', String(cb.headers.location || '').length > 0, String(cb.headers.location))
   eq('下发会话 Cookie', !!getCookie(cb, 'dsh_wua_session'), JSON.stringify(cb.headers['Set-Cookie']))
 }
 

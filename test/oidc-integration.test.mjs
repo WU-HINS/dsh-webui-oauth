@@ -309,9 +309,12 @@ let loginRes = null, stateFromCookie = null
 // 7) 回调：完整成功路径（浏览器真实走一遍 IdP 授权）
 {
   const { loginRes, callbackRes } = await browserSsoFlow()
-  const p = JSON.parse(callbackRes.body || '{}')
-  eq('回调成功 ok=true', p.ok === true, callbackRes.body)
-  eq('回跳核心带 launch token', typeof p.redirect === 'string' && p.redirect.includes('token=launch'), String(p.redirect))
+  // 成功路径必须是 302（浏览器顶层导航），不能渲染 {"ok":true,"redirect":...}——
+  // 回调时页面上没有我们的 JS 在跑，返回 JSON 会停在死页面上。
+  eq('回调成功返回 302（而非 JSON）', callbackRes.status === 302, String(callbackRes.status))
+  eq('302 指向带 launch token 的应用根',
+    String(callbackRes.headers.location || '').includes('token=launch'),
+    String(callbackRes.headers.location))
   const sess = getCookie(callbackRes, 'dsh_wua_session')
   eq('下发会话 Cookie', !!sess && sess.length > 20, String(sess))
   // 回调成功必须【同时】下发会话 Cookie 与清除一次性 state Cookie。

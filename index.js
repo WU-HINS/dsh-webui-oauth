@@ -2821,12 +2821,17 @@ export async function apply(ctx) {
         // 本地用户名，拿它当身份会张冠李戴）；审计里才用 sanitizeSub 过滤后的短标识。
         const s = createSession(rawSub, ttlOf(creds))
         await auditLog(ctx, 'oidc_login_success', { username: auditName, ip: meta.ip, ua: meta.ua })
-        // 授权往返结束：同时下发会话 Cookie 并清除一次性的 state 绑定 Cookie。
-        // Set-Cookie 必须走数组（sendJson 已支持多值），否则后者会覆盖前者、
-        // 导致"登录成功却没有会话"。
-        sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) }, {
+        // 授权往返结束：直接 302 回应用，并同时下发会话 Cookie、清除一次性 state Cookie。
+        //
+        // 不能返回 {"ok":true,"redirect":...} 让前端去跳：OIDC 回调是浏览器主导的
+        // 顶层导航，此时页面上并没有我们的 JS 在运行（用户是从登录页点了 SSO 按钮
+        // 被 302 到 IdP 再 302 回来的），渲染 JSON 就停在死页面上了。
+        // Set-Cookie 必须一次带两条（会话 + 清除 state），缺任一条都会出问题。
+        res.writeHead(302, {
+          location: postLoginRedirect(ctx, req),
           'Set-Cookie': [sessionCookie(s.token, s.maxAge), clearStateCookie['Set-Cookie']],
         })
+        res.end()
       } catch (e) {
         // 这里可能带上用户可控内容（如 code 解码、payload 结构异常），
         // 若原样回显会变成反射型注入的落点，因此固定文案、细节只进服务端日志。
