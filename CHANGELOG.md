@@ -2,6 +2,36 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.6.1
+
+修复 OIDC 配置保存被误拒、以及设置页看不到回调地址的问题。
+
+### 修复：再次保存 OIDC 配置总是失败
+
+- **现象**：改完 issuer / scope / Redirect Base 点保存，返回
+  `{"ok":false,"error":"oidc-invalid","reason":"clientSecret 须为非空字符串"}`，配置存不下去。
+- **原因**：设置页的 clientSecret 输入框每次打开都是空的（密钥不回传前端，这是有意的），
+  而服务端把"空串"也当成非法值拒掉——与它自己「留空保留原值」的语义、以及界面提示直接矛盾。
+- **修复**：空串/全空白按"未提供"处理，保留原值；只有**类型不对**才拒绝。
+  同时补上真正的边界：**首次启用**（此前没有 secret）时留空仍然拒绝并说明原因，
+  避免存下一个没有 secret 的配置、之后表现为莫名其妙的 `oidc-not-configured`。
+
+### 新增：设置页显示回调地址
+
+- 原生 OIDC 要求 `redirect_uri` 与 IdP 登记值**精确匹配**，少一个字符都会被拒。
+  此前界面只给路径常量，部署者得自己拼出完整地址（含 scheme/host/port）才能登记。
+- 现在设置页在 Redirect Base 下方直接给出**完整回调地址**（如
+  `https://dsh.example.com/dsh-webui-oauth/oidc/callback`），可原样抄进 IdP；
+  未填 Redirect Base 也无 `publicBaseUrl` 时，明确提示"无法确定"而不是猜一个错的。
+- `/status` 新增 `oidc.redirectUri` 与 `oidc.callbackPath`。
+
+### 测试
+
+- `test/oidc-bind.test.mjs` 扩充到 35 项：覆盖"首次启用须填 secret"、"再次保存留空被接受
+  且保留原值"、"留空不得清成空串"、"secret 类型错误仍拒绝"、"回调地址为完整 URL"、
+  "无法确定时返回 null 不猜"。
+- 全量 324 项断言通过。
+
 ## 0.6.0
 
 新增 **OIDC 身份绑定**：配置 OIDC 不再等于谁都能登录，必须显式绑定一个 IdP 身份。

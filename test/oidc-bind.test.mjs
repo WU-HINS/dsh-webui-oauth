@@ -15,7 +15,7 @@
 import http from 'node:http'
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { scryptSync, generateKeyPairSync, sign } from 'node:crypto'
 import { apply as applyPlugin } from '../index.js'
@@ -91,15 +91,22 @@ const idpPort = idp.address().port
 // ---------------- 宿主桩 ----------------
 const tmp = mkdtempSync(join(tmpdir(), 'oidc-bind-'))
 let credsText = null
+// OIDC 配置也走内存桩：否则 readOidcConfig 会去读真实文件系统，
+// 测试之间互相串味（且首次运行时文件不存在，表现为"配置丢失"）。
+let oidcText = null
 const fs = {
   async resolve(p) { return p },
   async readText(p) {
-    if (p === join(pluginRoot, 'dsh-webui-auth.json') || p.endsWith('dsh-webui-auth.json')) return credsText
+    if (p.endsWith('dsh-webui-auth.json')) return credsText
+    if (p.endsWith('dsh-webui-oauth.json')) return oidcText
     try { return readFileSync(p, 'utf8') } catch (e) { return null }
   },
   async writeText(p, data) {
     if (p.endsWith('dsh-webui-auth.json')) { credsText = data; return }
-    writeFileSync(p, data)
+    if (p.endsWith('dsh-webui-oauth.json')) { oidcText = data; return }
+    // 兜底写入一律落到临时目录，绝不碰仓库：曾经因为漏桩而把
+    // dsh-webui-oauth.json 写进过仓库根目录。
+    writeFileSync(join(tmp, basename(p)), data)
   },
 }
 const routes = new Map()
@@ -252,6 +259,82 @@ console.log('\n— 1b. 登录页（GET）必须能渲染，且 SSO 按钮跟随�
   credsText = JSON.stringify(baseCreds)
 }
 
+console.log('\n— 1c. OIDC 配置的保存语义（回归：secret 留空不得被拒）—')
+{
+  // 背景：设置页的 clientSecret 输入框每次打开都是空的（secret 不回传前端），
+  // 且提示写着"留空保留原值"。早先服务端把空串当非法值拒掉，导致
+  // 「改了 issuer/scope 再保存」这条路完全走不通——用户只能反复重填 secret，
+  // 每次改配置都要回 IdP 后台捞一次密钥。
+  const session = await loginLocal()
+  eq('本地登录成功（拿会话用于 configure）', !!session, String(session))
+  const H = { 'content-type': 'application/json', cookie: 'dsh_wua_session=' + session }
+
+  const base = { username: 'admin', current: 'pw12345678' }
+
+  // ① 首次启用：必须提供 secret
+  credsText = JSON.stringify({ ...baseCreds, oidc: undefined })
+  const first = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: '' } }),
+  })
+  eq('首次启用且 secret 留空 → 拒绝', first.json && first.json.ok === false, first.res.body)
+  eq('拒绝原因说明必须填 secret', /clientSecret/.test(String(first.json && first.json.reason)), first.res.body)
+
+  // ② 首次启用：带 secret 应成功
+  credsText = JSON.stringify({ ...baseCreds, oidc: undefined })
+  const okFirst = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: 'sec1' } }),
+  })
+  eq('首次启用带 secret → 成功', okFirst.json && okFirst.json.ok === true, okFirst.res.body)
+
+  // ③ 再次保存：secret 留空应被接受，且保留原值（这是曾经失败的那条路）
+  const resave = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: '', scope: 'openid profile' } }),
+  })
+  eq('再次保存且 secret 留空 → 接受（不再被误拒）', resave.json && resave.json.ok === true, resave.res.body)
+  // secret 存在独立的 dsh-webui-oauth.json（0.4.x 起），不在凭据文件里
+  const savedOidc = JSON.parse(oidcText || '{}')
+  eq('留空时保留原有 secret（不被清成空串）',
+    !!(savedOidc && savedOidc.oidc && savedOidc.oidc.clientSecret === 'sec1'),
+    JSON.stringify(savedOidc))
+
+  // ④ secret 类型错误仍要拒绝
+  const badType = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: 123 } }),
+  })
+  eq('secret 类型错误 → 拒绝', badType.json && badType.json.ok === false, badType.res.body)
+}
+
+console.log('\n— 1d. status 必须给出可抄进 IdP 的完整回调地址 —')
+{
+  // 原生 OIDC 要求 redirect_uri 精确匹配，少一个字符 IdP 就拒。
+  // 只给路径没法用，必须含 scheme/host/port。
+  // 注意：OIDC 配置自 0.4.x 起存在独立的 dsh-webui-oauth.json（oidcText），
+  // 不再放进凭据文件。写错位置会读到上一用例留下的旧配置。
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: 'sec1', redirectBase: 'https://dsh.example.com' },
+  })
+  const s = await statusWith(await loginLocal())
+  const o = (s.json && s.json.oidc) || {}
+  eq('status 给出完整回调地址',
+    o.redirectUri === 'https://dsh.example.com/dsh-webui-oauth/oidc/callback', String(o.redirectUri))
+  eq('同时给出回调路径常量', o.callbackPath === '/dsh-webui-oauth/oidc/callback', String(o.callbackPath))
+
+  // 未配置 redirectBase / publicBaseUrl 时不能瞎猜，应明确返回 null
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: 'https://idp.test', clientId: 'c1', clientSecret: 'sec1' },
+  })
+  const s2 = await statusWith(await loginLocal())
+  eq('无法确定 base 时回调地址为 null（不猜）',
+    (s2.json && s2.json.oidc && s2.json.oidc.redirectUri) === null,
+    JSON.stringify(s2.json && s2.json.oidc && s2.json.oidc.redirectUri))
+}
+
 console.log('\n— 2. 绑定端点存在且要求已登录 —')
 {
   eq('注册了 /oidc/bind', routes.has('/dsh-webui-oauth/oidc/bind'))
@@ -264,8 +347,14 @@ console.log('\n— 2. 绑定端点存在且要求已登录 —')
 
 console.log('\n— 3. 绑定后：只有该 sub 能登录 —')
 {
-  // 直接写入绑定关系（绑定流程本身由 oidc-integration 覆盖 IdP 往返）
+  // 直接写入绑定关系（绑定流程本身由 oidc-integration 覆盖 IdP 往返）。
+  // 注意同时把 OIDC 配置写成已知状态：前一个用例可能改过 oidcText，
+  // 不重置的话这里的 login 会因 base 解析失败而不 302，报一个与本节无关的错。
   credsText = JSON.stringify({ ...baseCreds, boundSub: 'sub-alice' })
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+  })
   const s = await statusWith(await loginLocal())
   eq('status 显示已绑定', s.json && s.json.oidc && s.json.oidc.bound === true, JSON.stringify(s.json && s.json.oidc))
   eq('status 只回传脱敏 sub，不回传原值',

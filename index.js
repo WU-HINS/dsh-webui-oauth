@@ -2036,6 +2036,36 @@ export async function apply(ctx) {
     const r = await readOidcConfig(ctx, creds)
     return r.oidc
   }
+
+  /**
+   * 算出「本部署的 OIDC 回调地址」，供设置页展示、供部署者填进 IdP 的允许列表。
+   *
+   * 原生 OIDC 要求 redirect_uri 与登记值**精确匹配**（含 scheme/host/port），
+   * 少一个字符都会被 IdP 拒绝，所以必须把完整地址明确告诉部署者，不能只给路径。
+   *
+   * 取值优先级与实际授权流程一致（见 startOidcAuthorize）：
+   *   1. oidc.redirectBase —— 部署者显式声明，反代场景下的确定性答案；
+   *   2. remote-web-ui.publicBaseUrl —— 同一份配置的复用；
+   *   3. 都没有 → 返回 null，前端提示"需先填 Redirect Base 或 publicBaseUrl"。
+   * 这里【不做】浏览器 origin 推断：设置页是服务端渲染时算的，拿不到将来的请求 Host，
+   * 猜一个反而会让人把错的地址填进 IdP。
+   *
+   * @returns {string|null} 形如 https://dsh.example.com/dsh-webui-oauth/oidc/callback
+   */
+  function resolveOidcRedirectUri(ctx2, oidcCfg) {
+    try {
+      let base = null
+      if (oidcCfg && typeof oidcCfg.redirectBase === 'string' && oidcCfg.redirectBase.trim()) {
+        base = oidcCfg.redirectBase.trim()
+      } else {
+        base = configuredOrigin(ctx2)
+      }
+      if (!base) return null
+      return base.replace(/\/$/, '') + OIDC_CALLBACK_PATH
+    } catch (e) {
+      return null
+    }
+  }
   async function oidcEnabled(creds) {
     const o = await oidcOf(creds)
     return !!(o && o.enabled === true && typeof o.issuer === 'string' && typeof o.clientId === 'string' && typeof o.clientSecret === 'string')
@@ -2237,8 +2267,13 @@ export async function apply(ctx) {
                 trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false,
                 bound: isOidcBound(creds),
                 boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null,
+                // 提供给 IdP 登记用的确切回调地址。原生 OIDC 要求 redirect_uri 精确匹配，
+                // 部署者必须把它抄进 IdP 的允许列表，因此这里直接算好给他。
+                // 不能只给路径：IdP 侧需要完整的 scheme + host + port。
+                redirectUri: resolveOidcRedirectUri(ctx, oidcCfg),
+                callbackPath: OIDC_CALLBACK_PATH,
               }
-            : { enabled: false, bound: isOidcBound(creds), boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null },
+            : { enabled: false, bound: isOidcBound(creds), boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null, redirectUri: null, callbackPath: OIDC_CALLBACK_PATH },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -2344,10 +2379,26 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'trustBrowserOrigin 须为 boolean' })
             return
           }
-          if (oidcIn.clientSecret !== undefined && (typeof oidcIn.clientSecret !== 'string' || !oidcIn.clientSecret.trim())) {
-            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：clientSecret 须为非空字符串（或留空保留旧值）' })
-            sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'clientSecret 须为非空字符串' })
+          // clientSecret：留空表示「保留原值」（见下方合并逻辑与 UI 提示）。
+          // 早先这里把空串也当非法值拒掉，导致"第二次保存配置"必然失败——
+          // 而设置页的输入框每次打开都是空的（secret 不回传前端），
+          // 于是「改了 issuer/scope 再保存」这条路根本走不通，用户只能反复重填 secret。
+          // 只有【类型不对】才算非法；空串/全空白按"未提供"处理。
+          if (oidcIn.clientSecret !== undefined && typeof oidcIn.clientSecret !== 'string') {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：clientSecret 须为字符串' })
+            sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'clientSecret 须为字符串' })
             return
+          }
+          // 首次配置（尚无旧 secret）时必须提供：否则会存下一个没有 secret 的配置，
+          // oidcEnabled() 判定为未启用，用户会看到莫名其妙的 oidc-not-configured。
+          if (oidcIn.enabled === true && !String(oidcIn.clientSecret || '').trim()) {
+            const prev = (await readOidcConfig(ctx, creds)).oidc
+            const hasPrev = !!(prev && typeof prev.clientSecret === 'string' && prev.clientSecret.trim())
+            if (!hasPrev) {
+              await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：首次启用必须提供 clientSecret' })
+              sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: '首次启用 OIDC 必须填写 clientSecret' })
+              return
+            }
           }
         }
         // 合并 OIDC 配置：oidcIn 提供时整段替换（secret 留空则保留旧值）；否则关闭。
