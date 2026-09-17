@@ -204,12 +204,18 @@ eq('注册 OIDC callback 端点', keys.includes('/dsh-webui-oauth/oidc/callback'
 eq('注册 OIDC logout 端点', keys.includes('/dsh-webui-oauth/oidc/logout'), keys.join(','))
 
 // 1) 未配置 OIDC：登录被拒
+//
+// 注意判定顺序：未绑定的检查排在"是否配置了 OIDC"之前（绑定是访问前提，
+// 先挡在最前面可以避免用户白走一趟 IdP 往返）。因此全新部署这里返回
+// oidc-not-bound 而不是 oidc-not-configured —— 两者都是"拒绝"，用例只断言拒绝，
+// 并额外锁定这个顺序，避免以后有人把检查顺序调回去却没人发现。
 {
   const res = makeRes()
   await routes.get('/dsh-webui-oauth/oidc/login').handler(
     makeReq('/dsh-webui-oauth/oidc/login?base=https://webui.example.com'), res)
   const p = JSON.parse(res.body || '{}')
-  eq('未配置 OIDC 拒绝登录', p.ok === false && p.error === 'oidc-not-configured', res.body)
+  eq('未配置/未绑定 OIDC 时拒绝登录', p.ok === false, res.body)
+  eq('拒绝原因是未绑定（未绑定检查优先于配置检查）', p.error === 'oidc-not-bound', res.body)
   eq('HTTP 200', res.status, 200)
 }
 
@@ -220,7 +226,9 @@ const oidcCfg = {
   enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
   scope: 'openid profile email', redirectBase: 'https://webui.example.com', trustBrowserOrigin: false,
 }
-credsText = JSON.stringify({ v: 4, username: 'admin', hash, ttl: 12, oidc: oidcCfg })
+// boundSub：OIDC 登录要求 sub 与已绑定值一致（0.6.0 引入）。
+// 这里绑定 IdP 会签发的那个 sub，使后续登录用例能走到"登录成功"分支。
+credsText = JSON.stringify({ v: 4, username: 'admin', hash, ttl: 12, oidc: oidcCfg, boundSub: 'idp-subject-42' })
 
 // 3) status 暴露 OIDC 信息且不泄露 secret
 {

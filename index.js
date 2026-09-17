@@ -387,6 +387,48 @@ async function writeCredentials(ctx, creds) {
   await ctx.fs.writeText(target, JSON.stringify(creds), undefined, undefined, { mode: 'danger-full-access' })
 }
 
+// ---------------- OIDC 身份绑定（sub 白名单） ----------------
+//
+// 语义（按部署者确认的验收标准）：
+//   - 绑定前：OIDC 登录【一律拒绝】。配置了 OIDC 只代表「允许发起授权」，
+//     不代表谁都能登录——否则任何能通过该 IdP 的人都能进 WebUI。
+//   - 绑定：本地账号登录后，在设置页点「绑定」，走一次 OIDC 授权，把回调里
+//     校验通过的 sub 存进凭据文件（boundSub）。此后只有这一个 sub 能登录。
+//   - 解绑：把 boundSub 清空，OIDC 登录立即恢复为「一律拒绝」。
+//
+// 存放位置：凭据文件 dsh-webui-auth.json 的 boundSub 字段。与 username/hash 同文件，
+// 因为它们同属「谁可以进这个 WebUI」这一件事，且该目录已是 0600。
+// 旧版凭据文件没有该字段 → 读出来是 undefined → 视为未绑定，行为即「拒绝 OIDC 登录」，
+// 这对既有部署是安全的方向（不会因为升级而放开访问）。
+
+/** 取已绑定的 sub；未绑定/非法时返回 null。 */
+function boundSubOf(creds) {
+  if (!creds || typeof creds.boundSub !== 'string') return null
+  const s = creds.boundSub
+  return s.length > 0 ? s : null
+}
+
+/** 当前是否已绑定 OIDC 身份。 */
+function isOidcBound(creds) {
+  return boundSubOf(creds) !== null
+}
+
+/**
+ * 给界面展示用的 sub 掩码。
+ *
+ * 为什么不直接用 sanitizeSub：那是「日志注入防护」——只把不安全字符换成下划线、
+ * 截断长度，内容本身照样完整可见。拿它回传前端等于把 sub 明文发给了浏览器。
+ * 界面只需要让操作者辨认「绑的是哪一个」，不需要拿到可用于构造 token 的原始标识，
+ * 因此这里保留首尾少量字符、中间打码。
+ *
+ * 极短的 sub（≤4）整串打码，避免"保留首尾"退化成几乎明文。
+ */
+function maskSubForDisplay(sub) {
+  if (typeof sub !== 'string' || !sub) return null
+  if (sub.length <= 4) return '*'.repeat(sub.length)
+  return sub.slice(0, 2) + '*'.repeat(Math.max(4, sub.length - 4)) + sub.slice(-2)
+}
+
 /**
  * 读取 OIDC 配置。优先独立文件 dsh-webui-oauth.json；不存在时回落到
  * dsh-webui-auth.json 的 oidc 段（旧版布局），实现无感升级。
@@ -2011,7 +2053,10 @@ export async function apply(ctx) {
           const oidcOn = await oidcEnabled(credsNow)
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
-            .replace('__OIDC_ENABLED__', oidcOn ? 'true' : 'false')
+            // SSO 按钮的显示条件 = 已配置 OIDC **且**已绑定身份。
+            // 只判配置会让未绑定的部署显示一个点了必然被拒的按钮（oidc-not-bound），
+            // 用户会以为坏了。绑定是访问前提，按钮就该跟着绑定状态走。
+            .replace('__OIDC_ENABLED__', oidcOn && isOidcBound(credsNow) ? 'true' : 'false')
             .replace('__THEME_PREFERENCE__', themePreference(ctx))
           res.writeHead(200, {
             'content-type': 'text/html; charset=utf-8',
@@ -2179,7 +2224,21 @@ export async function apply(ctx) {
               return { trustBrowserOrigin: pol.trust, configuredOrigin: configuredOrigin(ctx) }
             } catch (e) { return null }
           })(),
-          oidc: oidcOn ? { enabled: true, issuer: oidcCfg.issuer, clientId: oidcCfg.clientId, scope: oidcCfg.scope, redirectBase: oidcCfg.redirectBase, trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false } : { enabled: false },
+          // bound/boundSubHint 供设置页展示绑定状态。
+          // 只回传 sub 的**脱敏短标识**：sub 是 IdP 侧的稳定标识符，全量回传给前端
+          // 没有功能需要（绑定只需显示"已绑定到谁"），却会把它暴露在浏览器里。
+          oidc: oidcOn
+            ? {
+                enabled: true,
+                issuer: oidcCfg.issuer,
+                clientId: oidcCfg.clientId,
+                scope: oidcCfg.scope,
+                redirectBase: oidcCfg.redirectBase,
+                trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false,
+                bound: isOidcBound(creds),
+                boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null,
+              }
+            : { enabled: false, bound: isOidcBound(creds), boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -2381,7 +2440,68 @@ export async function apply(ctx) {
 
   // ---------------- OIDC SSO 端点 ----------------
 
-  // 发起 OIDC 授权：GET /dsh-webui-oauth/oidc/login?base=<前端origin>
+  /**
+   * 发起一次 OIDC 授权往返，302 到 IdP。登录与绑定共用（唯一区别是 purpose）。
+   *
+   * purpose 会随 state 一起暂存，回调据此决定这是"登录"还是"绑定"：
+   *   - 'login'：校验 sub 必须等于已绑定值，否则拒绝；
+   *   - 'bind' ：把校验通过的 sub 写入 boundSub。
+   * 把用途放在服务端 state 表里而不是 query 参数：query 由浏览器可控，
+   * 若能通过改 URL 把绑定流程变成登录流程，绑定就形同虚设。
+   *
+   * @returns {Promise<void>} 直接写响应，不返回内容
+   */
+  async function startOidcAuthorize(ctx2, req, res, purpose) {
+    const creds = await readCredentials(ctx2)
+    const o = await oidcOf(creds)
+    if (!(await oidcEnabled(creds))) {
+      sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
+      return
+    }
+    // 决定回调 base：与登录后 token 跳转共用 remote-web-ui 段的统一开关。
+    let frontendBase = null
+    if (typeof req.url === 'string') {
+      const m = /[?&]base=([^&]+)/.exec(req.url)
+      if (m) { try { frontendBase = decodeURIComponent(m[1]) } catch (e) { frontendBase = null } }
+    }
+    const base = resolveOidcBase(o, frontendBase, trustedOriginPolicy(ctx2, o))
+    if (!base) {
+      sendJson(res, 200, { ok: false, error: 'oidc-base-unresolvable', hint: '请在设置中配置 redirectBase（反代场景），或让浏览器从登录页发起 SSO 登录' })
+      return
+    }
+    const redirectUri = base.replace(/\/$/, '') + OIDC_CALLBACK_PATH
+    // 拉取 Discovery（缓存）；失败则引导检查 issuer 配置。
+    const disc = await oidcDiscovery.get(o.issuer)
+    if (!disc.ok || !disc.metadata) {
+      const meta = requestMeta(req)
+      await auditLog(ctx2, 'oidc_discovery_failure', { issuer: o.issuer, ip: meta.ip, ua: meta.ua, detail: disc.error })
+      sendJson(res, 200, { ok: false, error: 'oidc-discovery-failed', detail: disc.error })
+      return
+    }
+    // 生成 state / nonce / PKCE verifier，按 TTL 暂存（含容量上限，防灌爆）。
+    const state = oidcRandom(24)
+    const nonce = oidcRandom(24)
+    const verifier = oidcRandom(32)
+    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose })
+    const authUrl = new URL(disc.metadata.authorization_endpoint)
+    authUrl.searchParams.set('response_type', 'code')
+    authUrl.searchParams.set('client_id', o.clientId)
+    authUrl.searchParams.set('redirect_uri', redirectUri)
+    authUrl.searchParams.set('scope', typeof o.scope === 'string' && o.scope.trim() ? o.scope.trim() : 'openid profile email')
+    authUrl.searchParams.set('state', state)
+    authUrl.searchParams.set('nonce', nonce)
+    authUrl.searchParams.set('code_challenge', oidcChallenge(verifier))
+    authUrl.searchParams.set('code_challenge_method', 'S256')
+    authUrl.searchParams.set('prompt', 'select_account')
+    // 登录 CSRF 绑定：把 state 同时写进一个 HttpOnly 短时效 Cookie。回调时两者必须
+    // 同时匹配——否则攻击者可先在自己的浏览器发起授权拿到 state，再诱导受害者带着
+    // 该 state 完成回调，把受害者的浏览器登录进攻击者的账号（会话固定/登录 CSRF）。
+    res.setHeader('Set-Cookie', COOKIE_OIDC_STATE + '=' + state + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + Math.floor(OIDC_STATE_TTL_MS / 1000))
+    res.writeHead(302, { location: authUrl.href })
+    res.end()
+  }
+
+  // 发起 OIDC 登录授权：GET /dsh-webui-oauth/oidc/login?base=<前端origin>
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/dsh-webui-oauth/oidc/login',
@@ -2391,58 +2511,88 @@ export async function apply(ctx) {
           sendJson(res, 405, { error: '仅支持 GET' })
           return
         }
-        const creds = await readCredentials(ctx)
-        const o = await oidcOf(creds)
-        if (!(await oidcEnabled(creds))) {
-          sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
+        // 未绑定任何 sub 时不允许发起登录：绑定是访问前提，先挡在最前面，
+        // 免得用户走完整个 IdP 往返才被拒（体验差且浪费一次授权）。
+        const creds0 = await readCredentials(ctx)
+        if (!isOidcBound(creds0)) {
+          sendJson(res, 200, { ok: false, error: 'oidc-not-bound', hint: '请先用本地账号登录，在设置页「身份认证」中绑定 OIDC 身份' })
           return
         }
-        // 决定回调 base：与登录后 token 跳转共用 remote-web-ui 段的统一开关。
-        let frontendBase = null
-        if (typeof req.url === 'string') {
-          const m = /[?&]base=([^&]+)/.exec(req.url)
-          if (m) { try { frontendBase = decodeURIComponent(m[1]) } catch (e) { frontendBase = null } }
-        }
-        const base = resolveOidcBase(o, frontendBase, trustedOriginPolicy(ctx, o))
-        if (!base) {
-          sendJson(res, 200, { ok: false, error: 'oidc-base-unresolvable', hint: '请在设置中配置 redirectBase（反代场景），或让浏览器从登录页发起 SSO 登录' })
-          return
-        }
-        const redirectUri = base.replace(/\/$/, '') + OIDC_CALLBACK_PATH
-        // 拉取 Discovery（缓存）；失败则引导检查 issuer 配置。
-        const disc = await oidcDiscovery.get(o.issuer)
-        if (!disc.ok || !disc.metadata) {
-          const meta = requestMeta(req)
-          await auditLog(ctx, 'oidc_discovery_failure', { issuer: o.issuer, ip: meta.ip, ua: meta.ua, detail: disc.error })
-          sendJson(res, 200, { ok: false, error: 'oidc-discovery-failed', detail: disc.error })
-          return
-        }
-        // 生成 state / nonce / PKCE verifier，按 TTL 暂存（含容量上限，防灌爆）。
-        const state = oidcRandom(24)
-        const nonce = oidcRandom(24)
-        const verifier = oidcRandom(32)
-        oidcStateStore.put(state, { nonce, verifier, redirectUri })
-        const authUrl = new URL(disc.metadata.authorization_endpoint)
-        authUrl.searchParams.set('response_type', 'code')
-        authUrl.searchParams.set('client_id', o.clientId)
-        authUrl.searchParams.set('redirect_uri', redirectUri)
-        authUrl.searchParams.set('scope', typeof o.scope === 'string' && o.scope.trim() ? o.scope.trim() : 'openid profile email')
-        authUrl.searchParams.set('state', state)
-        authUrl.searchParams.set('nonce', nonce)
-        authUrl.searchParams.set('code_challenge', oidcChallenge(verifier))
-        authUrl.searchParams.set('code_challenge_method', 'S256')
-        authUrl.searchParams.set('prompt', 'select_account')
-        // 登录 CSRF 绑定：把 state 同时写进一个 HttpOnly 短时效 Cookie。回调时两者必须
-        // 同时匹配——否则攻击者可先在自己的浏览器发起授权拿到 state，再诱导受害者带着
-        // 该 state 完成回调，把受害者的浏览器登录进攻击者的账号（会话固定/登录 CSRF）。
-        res.setHeader('Set-Cookie', COOKIE_OIDC_STATE + '=' + state + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + Math.floor(OIDC_STATE_TTL_MS / 1000))
-        res.writeHead(302, { location: authUrl.href })
-        res.end()
+        await startOidcAuthorize(ctx, req, res, 'login')
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
     },
   }), 'dsh-webui-oauth: oidc login')
+
+  // 发起 OIDC 绑定授权：GET /dsh-webui-oauth/oidc/bind
+  //
+  // 必须先持有有效的本地会话（已登录）——绑定语义是"把我这个管理员账号
+  // 与某个 IdP 身份关联起来"，不能让未认证者触发。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/bind',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        await startOidcAuthorize(ctx, req, res, 'bind')
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc bind')
+
+  // 解除 OIDC 绑定：POST /dsh-webui-oauth/oidc/unbind
+  //
+  // 清空 boundSub 后，OIDC 登录立即回到"一律拒绝"（见回调里的 bound 判空）。
+  // 需要当前密码，避免会话被盗后攻击者悄悄解绑（解绑本身是安全降级操作，
+  // 但仍属于"改认证配置"，与 disable/configure 保持一致的验证强度）。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/unbind',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const creds = await readCredentials(ctx)
+        const meta = requestMeta(req)
+        const current = String(body.current || '')
+        const curValid = current && creds && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+        if (!curValid) {
+          await auditLog(ctx, 'oidc_unbind_failure', { username: creds && creds.username ? creds.username : null, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
+          sendJson(res, 200, { ok: false, error: 'current-invalid' })
+          return
+        }
+        if (!isOidcBound(creds)) {
+          sendJson(res, 200, { ok: true, bound: false, alreadyUnbound: true })
+          return
+        }
+        // 只删 boundSub，其余字段原样保留。
+        const next = { ...creds }
+        delete next.boundSub
+        await writeCredentials(ctx, next)
+        await auditLog(ctx, 'oidc_unbind_success', { username: creds.username, ip: meta.ip, ua: meta.ua })
+        sendJson(res, 200, { ok: true, bound: false })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc unbind')
 
   // OIDC 回调：GET /dsh-webui-oauth/oidc/callback?code&state
   ctx.effect(() => ctx.webServer.register({
@@ -2550,10 +2700,37 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: false, error: 'oidc-invalid-id-token', detail: vres.error })
           return
         }
-        // 建本地会话。身份用**原始 sub**（sanitize 是有损的：'a/b' 与 'a_b' 会塌成同一个
-        // 本地用户名，拿它当身份会张冠李戴）；审计里才用 sanitizeSub 过滤后的短标识。
         const rawSub = vres.payload.sub
         const auditName = sanitizeSub(rawSub)
+
+        // 用途分支：绑定 vs 登录。purpose 来自服务端 state 表（见 startOidcAuthorize），
+        // 浏览器无法通过改 URL 把绑定流程降级成登录流程。
+        if (st.purpose === 'bind') {
+          // 绑定：把本次校验通过的 sub 记进凭据文件。
+          // 保留原有 username/hash/ttl，只加 boundSub —— 用 spread 以免漏字段。
+          await writeCredentials(ctx, { ...creds, boundSub: rawSub })
+          await auditLog(ctx, 'oidc_bind_success', { username: auditName, ip: meta.ip, ua: meta.ua })
+          sendJson(res, 200, { ok: true, bound: true, sub: auditName }, clearStateCookie)
+          return
+        }
+
+        // 登录：sub 必须与已绑定值完全一致，否则拒绝。
+        // 这一步是访问控制的核心——没有它，任何能通过该 IdP 的人都能进 WebUI。
+        // 用恒定时间比较，避免通过响应时间侧信道逐字节猜出 boundSub。
+        const bound = boundSubOf(creds)
+        if (!bound) {
+          await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: '尚未绑定 OIDC 身份，拒绝登录' })
+          sendJson(res, 200, { ok: false, error: 'oidc-not-bound' }, clearStateCookie)
+          return
+        }
+        if (!safeTokenEquals(String(rawSub), bound)) {
+          await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: 'sub 与已绑定身份不匹配，拒绝登录' })
+          sendJson(res, 200, { ok: false, error: 'oidc-sub-mismatch', detail: '该 IdP 身份未被绑定到本 WebUI' }, clearStateCookie)
+          return
+        }
+
+        // 建本地会话。身份用**原始 sub**（sanitize 是有损的：'a/b' 与 'a_b' 会塌成同一个
+        // 本地用户名，拿它当身份会张冠李戴）；审计里才用 sanitizeSub 过滤后的短标识。
         const s = createSession(rawSub, ttlOf(creds))
         await auditLog(ctx, 'oidc_login_success', { username: auditName, ip: meta.ip, ua: meta.ua })
         // 授权往返结束：同时下发会话 Cookie 并清除一次性的 state 绑定 Cookie。
