@@ -200,7 +200,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath, sendJson, makeOidcStateStore }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath, sendJson, makeOidcStateStore, makeDiscoveryCache }
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -1690,13 +1690,15 @@ export function validateIdToken(idToken, opts) {
 // 仅接受 HTTPS issuer。返回 { ok, error, metadata }。
 export async function fetchOidcDiscovery(issuer, opts) {
   try {
+    // opts.fetchImpl 仅用于测试注入（见 makeDiscoveryCache 的说明）。
+    const doFetch = opts && typeof opts.fetchImpl === 'function' ? opts.fetchImpl : (...a) => fetch(...a)
     if (typeof issuer !== 'string' || !issuer.trim()) return { ok: false, error: 'bad-issuer', metadata: null }
     const issuerUrl = new URL(issuer.trim())
     if (issuerUrl.protocol !== 'https:') return { ok: false, error: 'issuer-not-https', metadata: null }
     // RFC 8414 / OIDC Discovery：issuer 路径拼接 .well-known。
     const base = issuerUrl.href.replace(/\/$/, '')
     const url = base + '/.well-known/openid-configuration'
-    const res = await fetch(url, {
+    const res = await doFetch(url, {
       headers: { accept: 'application/json', 'user-agent': 'dsh-webui-oauth/0.4.0' },
       // 不跟随重定向：issuer 是部署者配置的信任锚，跟随跳转就把它交给远端决定
       // （可被用来把 discovery 引到任意主机）。需要跳转的部署应直接配置最终 issuer。
@@ -1726,7 +1728,10 @@ export async function fetchOidcDiscovery(issuer, opts) {
 }
 
 // 拉取 JWKS 并缓存（内存 1h，失败则下次重试）。
-function makeDiscoveryCache() {
+function makeDiscoveryCache(fetchImpl) {
+  // fetchImpl 仅用于测试注入：默认用全局 fetch。这样缓存与刷新逻辑（含密钥轮换
+  // 后的重取）可以在无网络、无 TLS 的环境里被完整测试。
+  const doFetch = typeof fetchImpl === 'function' ? fetchImpl : (...args) => fetch(...args)
   const cache = new Map() // issuer -> { ts, metadata, jwks }
   async function get(issuer) {
     const now = Date.now()
@@ -1737,7 +1742,7 @@ function makeDiscoveryCache() {
     if (hit && now - hit.ts < 3600_000 && hit.metadata) {
       return { ok: true, error: null, metadata: hit.metadata, jwks: hit.jwks }
     }
-    const r = await fetchOidcDiscovery(issuer)
+    const r = await fetchOidcDiscovery(issuer, { fetchImpl: doFetch })
     if (!r.ok) return { ...r, jwks: null }
     let jwks = null
     // jwks_uri 必须与 issuer 同源：否则一次 discovery 响应就能把密钥来源指向任意主机
@@ -1748,7 +1753,7 @@ function makeDiscoveryCache() {
         if (jwksUrl.origin !== new URL(issuer).origin) {
           return { ok: false, error: 'jwks-cross-origin', metadata: r.metadata, jwks: null }
         }
-        const jres = await fetch(r.metadata.jwks_uri, { headers: { accept: 'application/json' }, redirect: 'error' })
+        const jres = await doFetch(r.metadata.jwks_uri, { headers: { accept: 'application/json' }, redirect: 'error' })
         if (jres.ok) {
           const jtxt = await jres.text()
           const parsed = JSON.parse(jtxt)
@@ -1763,7 +1768,25 @@ function makeDiscoveryCache() {
     cache.set(issuer, { ts: now, metadata: r.metadata, jwks })
     return { ok: true, error: null, metadata: r.metadata, jwks }
   }
-  return { get }
+  /**
+   * 跳过缓存强制重新拉取（`get` 的 force 参数）。
+   *
+   * 存在的理由：IdP 轮换签名密钥（kid 换新）后，缓存里那把旧 key 会让
+   * `findJwk` 找不到匹配 → `no-signing-key` / `bad-signature`，
+   * 而缓存 TTL 是 1 小时——等于密钥轮换后最长 1 小时无法登录。
+   * 实测过：同一个进程里把 IdP 的签名算法/密钥换掉，登录立刻开始失败，
+   * 重启进程才恢复（缓存被清空）。
+   *
+   * 调用方仅在【验签失败】且【本次用的是缓存】时才重试一次，避免把
+   * 缓存彻底架空（正常路径仍走缓存，不受影响）。
+   * @param {string} issuer
+   * @returns {Promise<object>} 与 get 同结构
+   */
+  async function refresh(issuer) {
+    cache.delete(issuer)
+    return get(issuer)
+  }
+  return { get, refresh }
 }
 
 /**
@@ -2505,7 +2528,23 @@ export async function apply(ctx) {
           return
         }
         // 验证 id_token
-        const vres = validateIdToken(idToken, { issuer: o.issuer, clientId: o.clientId, nonce: st.nonce, jwks: disc.jwks })
+        let vres = validateIdToken(idToken, { issuer: o.issuer, clientId: o.clientId, nonce: st.nonce, jwks: disc.jwks })
+        // IdP 轮换签名密钥（或更换签名算法）后，进程内缓存的 JWKS 会在最长 1 小时内
+        // 找不到 token 的 kid/alg。这类失败是可自愈的，但缓存不失效就让每个用户先坏一小时。
+        // 因此：签名相关失败时强制绕过缓存重取一次 JWKS，再验一次。
+        // 只在签名类错误上重试（no-signing-key / bad-signature）；claims 类错误重试没有意义。
+        if (!vres.ok && (vres.error === 'no-signing-key' || vres.error === 'bad-signature')) {
+          const originalError = vres.error   // 先记下原错误，后面 vres 会被覆盖
+          const fresh = await oidcDiscovery.refresh(o.issuer)
+          if (fresh.ok && fresh.jwks) {
+            const retry = validateIdToken(idToken, { issuer: o.issuer, clientId: o.clientId, nonce: st.nonce, jwks: fresh.jwks })
+            if (retry.ok) {
+              vres = retry
+              // 审计一次，便于运维发现 IdP 确实发生了密钥轮换（而非每次登录都触发）。
+              await auditLog(ctx, 'oidc_jwks_refreshed', { ip: meta.ip, ua: meta.ua, detail: '缓存 JWKS 未命中，已强制刷新并验签通过（原错误: ' + originalError + '）' })
+            }
+          }
+        }
         if (!vres.ok) {
           await auditLog(ctx, 'oidc_login_failure', { ip: meta.ip, ua: meta.ua, detail: 'id_token 验证失败: ' + vres.error })
           sendJson(res, 200, { ok: false, error: 'oidc-invalid-id-token', detail: vres.error })

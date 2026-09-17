@@ -362,6 +362,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 - **HTTPS 反代且未下发协议头**：登录后跳转的 scheme 依赖 ①`remote-web-ui.publicBaseUrl` 或 ②反代下发的 `X-Forwarded-Proto`/`Forwarded`。两者都没有时只能兜底 `http`（此时 https 端口会握手失败、页面「点了没反应」）。请二选一：在 `settings.yaml` 声明对外地址，或让反代 `proxy_set_header X-Forwarded-Proto $scheme;`。注意 `publicBaseUrl` 仅在与请求 Host 一致时生效，用来避免把局域网直连改写到公网。
 - **反代改写 Host 且不下发原始主机头**：此时服务端拿不到浏览器侧地址，未配置 `publicBaseUrl` 得不到正确跳转（会指向内网 upstream 端口）；而 `publicBaseUrl` 因 authority 不匹配同样不生效。**唯一可行的解法是让反代下发 `X-Forwarded-Host`**（Caddy 默认下发）或保留原始 Host。详见「全流程实测结果」C 节的实测总表。
 - **`--trusted-host` 不能省**：桌面浏览器用密码登录后**直连 `/api`** 的请求依赖 `--trusted-host <对外域名:端口>`；而 remote-web-ui 的配对流（`/remote` 通道）不需要它。删掉该参数会导致 `/api` 全 403。
+- **JWKS 缓存与密钥轮换**：discovery + JWKS 有 1 小时内存缓存。IdP 轮换签名密钥后，缓存里那把旧 key 会匹配不上，此时插件**自动**绕过缓存重取一次并记 `oidc_jwks_refreshed` 审计（0.5.1 起）。代价是每次密钥轮换会有一次额外的 JWKS 请求；若 IdP 在极短时间内反复轮换，可能表现为登录偶发变慢。
 - **审计假名化的边界**：HMAC 密钥与审计日志同目录（0600），能读取密钥文件的本地攻击者可对 IP 空间暴力还原；假名化防的是「日志明文落盘」，不是防有文件权限的攻击者。
 - 会话存于数据目录 `sessions.jsonl`：重启后仍生效（到期时间不变）；关闭/卸载插件不影响凭据。
 - 威胁模型为「浏览器/网络客户端」：能直接读写宿主进程内存或文件的本地进程不在防护范围内。
