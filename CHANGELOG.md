@@ -2,6 +2,35 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.6.3
+
+修复部分 IdP 下**绑定 OIDC 立即失败**的问题（点「绑定 OIDC 身份」后立刻收到
+`oidc-authorize-failed / invalid_request`）。
+
+### 修复：授权请求携带了 IdP 不支持的 prompt 参数
+
+- **现象**：点绑定后浏览器被 IdP 打回，回调形如
+  `.../oidc/callback?error=invalid_request&error_description=unsupported+prompt+value+requested`，
+  界面显示 `{"ok":false,"error":"oidc-authorize-failed","detail":"invalid_request"}`。
+- **原因**：插件在授权请求里**硬编码**了 `prompt=select_account`。该参数是 OIDC 的
+  可选扩展，不同 IdP 支持度差异极大；不支持的 IdP 会直接拒绝整个授权请求，
+  于是授权根本发不出去。
+- **修复**：默认**不发送** `prompt`。需要"强制选择账号"行为的部署可在设置页
+  **Prompt（可选）** 里显式填写（如 `select_account`），留空即不携带该参数。
+
+### 建议
+
+- 若你此前被此问题挡住，升级后**重新点一次绑定**即可，无需改动其它配置。
+- 多数 IdP 的登录页本来就会让用户选择账号，因此该参数通常不必填。
+
+### 测试
+
+- `test/oidc-integration.test.mjs` 增加两条断言：默认不携带 `prompt`、
+  显式配置时如实携带。已确认能抓出修复前的行为（回退硬编码时 2 项 FAIL）。
+- 另在隔离实例上用**会拒绝 prompt 的 IdP**（复刻同类行为）做了端到端对照：
+  带 `prompt` 复现出完全相同的错误；去掉后绑定成功、随后 SSO 登录成功。
+- 全量 337 项断言通过。
+
 ## 0.6.2
 
 修复设置页在**切走再切回**时不回显已有配置的问题。

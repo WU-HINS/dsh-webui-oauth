@@ -2267,6 +2267,8 @@ export async function apply(ctx) {
                 trustBrowserOrigin: oidcCfg.trustBrowserOrigin !== false,
                 bound: isOidcBound(creds),
                 boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null,
+                // prompt 是可选参数，回传当前值供设置页回显（缺省为空 = 不发送）。
+                prompt: typeof oidcCfg.prompt === 'string' ? oidcCfg.prompt : '',
                 // 提供给 IdP 登记用的确切回调地址。原生 OIDC 要求 redirect_uri 精确匹配，
                 // 部署者必须把它抄进 IdP 的允许列表，因此这里直接算好给他。
                 // 不能只给路径：IdP 侧需要完整的 scheme + host + port。
@@ -2415,6 +2417,9 @@ export async function apply(ctx) {
             scope: typeof oidcIn.scope === 'string' ? oidcIn.scope : undefined,
             redirectBase: typeof oidcIn.redirectBase === 'string' && oidcIn.redirectBase.trim() ? oidcIn.redirectBase.trim() : undefined,
             trustBrowserOrigin: oidcIn.trustBrowserOrigin !== undefined ? oidcIn.trustBrowserOrigin : true,
+            // prompt 默认不发（留空即 undefined）。仅在部署者显式填写时才带给 IdP，
+            // 因为不少 IdP 会因不认识的 prompt 值直接拒绝授权。
+            prompt: typeof oidcIn.prompt === 'string' && oidcIn.prompt.trim() ? oidcIn.prompt.trim() : undefined,
           }
         } else if (oidcIn && oidcIn.enabled === false) {
           oidcOut = { enabled: false }
@@ -2543,7 +2548,15 @@ export async function apply(ctx) {
     authUrl.searchParams.set('nonce', nonce)
     authUrl.searchParams.set('code_challenge', oidcChallenge(verifier))
     authUrl.searchParams.set('code_challenge_method', 'S256')
-    authUrl.searchParams.set('prompt', 'select_account')
+    // prompt 是 OIDC 的【可选】参数，且不同 IdP 支持度差异极大：
+    // 部分 IdP（如某些企业 SSO）对不认识的 prompt 值直接回
+    // error=invalid_request&error_description=unsupported prompt value requested，
+    // 导致授权根本发不出去——表现就是"点绑定立刻失败"。
+    // 因此这里【默认不发送】：多数 IdP 的登录页本来就会让用户选账号，
+    // 显式 select_account 只对"已登录且想强制切换账号"的场景有意义。
+    // 需要该行为的部署可通过 oidc.prompt 显式声明（见 README）。
+    const promptValue = typeof o.prompt === 'string' ? o.prompt.trim() : ''
+    if (promptValue) authUrl.searchParams.set('prompt', promptValue)
     // 登录 CSRF 绑定：把 state 同时写进一个 HttpOnly 短时效 Cookie。回调时两者必须
     // 同时匹配——否则攻击者可先在自己的浏览器发起授权拿到 state，再诱导受害者带着
     // 该 state 完成回调，把受害者的浏览器登录进攻击者的账号（会话固定/登录 CSRF）。

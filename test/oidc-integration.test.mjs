@@ -257,8 +257,26 @@ let loginRes = null, stateFromCookie = null
   eq('携带 nonce', !!q.get('nonce'), String(q.get('nonce')))
   eq('redirect_uri = redirectBase + 固定回调路径',
     q.get('redirect_uri'), 'https://webui.example.com/dsh-webui-oauth/oidc/callback')
+  // prompt 默认【不发送】。回归：曾经硬编码 prompt=select_account，而部分 IdP
+  // 会对不认识的值直接拒绝授权（error=invalid_request，
+  // error_description="unsupported prompt value requested"），表现为"点绑定立即失败"。
+  eq('默认不携带 prompt 参数（避免 IdP 因不认识的取值拒绝授权）',
+    q.get('prompt') === null, String(q.get('prompt')))
   stateFromCookie = getCookie(loginRes, 'dsh_wua_oidc_state')
   eq('下发 state 绑定 Cookie', stateFromCookie === q.get('state'), String(stateFromCookie))
+}
+
+// 4b) 显式配置 prompt 时应如实携带（给需要强制选账号的部署用）
+{
+  const savedCreds = credsText
+  const cfg = JSON.parse(savedCreds)
+  cfg.oidc = { ...cfg.oidc, prompt: 'login' }   // 部署者显式声明
+  credsText = JSON.stringify(cfg)
+  const res = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/login').handler(makeReq('/dsh-webui-oauth/oidc/login'), res)
+  const q2 = new URL(res.headers.location).searchParams
+  eq('显式配置 prompt 时如实携带', q2.get('prompt') === 'login', String(q2.get('prompt')))
+  credsText = savedCreds
 }
 
 // 5) 回调：state 缺失 → 拒绝
