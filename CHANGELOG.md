@@ -2,6 +2,87 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.6.7
+
+安全修复：路由闸门由**黑名单**改为**默认拒绝的白名单**。此前只包 `/api` 与
+`/plugins`，第三方插件注册的读接口完全裸奔。
+
+### 修复：未登录可读任意第三方插件的路由
+
+- **现象（实测）**：未登录、不带任何 Cookie，以下端点直接 200：
+  - `/dsh-550c-boot/update` —— 版本 / 镜像指纹
+  - `/dsh-any-background/font` —— 用户上传字体（12,079,480 B）
+  - `/dsh-any-background/wallpaper` —— 用户壁纸
+  与此同时写端点（`/font/upload` 等）因为走 connection RPC 通道反而 401。
+  即典型的「**写保护、读裸奔**」。
+- **原因**：webServer 的匹配顺序是「exact 优先，其次最长前缀」。闸门原来只包装
+  `/api` 与 `/plugins` 两条前缀，第三方插件注册的 `/dsh-any-background`、
+  `/dsh-550c-boot/update` 等比本插件的 `""` 前缀更具体，会抢在闸门之前命中，
+  于是完全绕过鉴权。黑名单永远追不上「下一个装上的插件」。
+- **修复**：改为**默认拒绝**。安装闸门时枚举并包装 webServer 上的**全部**路由：
+  - 所有 `exact` 路由 → 401（白名单/自管端点除外）
+  - 所有 `prefix` 路由 → 401（仅本插件自己的 `""` 传输闸门除外，它负责 302 到登录页）
+  - **所有** WebSocket upgrade → 一律拒绝（不再只认 `/api/remote.mux`）
+  - `fallback` 处理器 → 同样要求会话
+  - 并且接管 `exact/prefixes/upgrades` 三张路由表的 `set`，**注册那一刻就上闸门**，
+    消除「新装插件到下一次重扫（最长 10s）之间」的裸奔窗口。
+
+### 公开白名单（能匿名访问的全部路径）
+
+`/dsh-webui-oauth/login`、`/setup`、`/oidc/login`、`/oidc/callback`、
+`/oauth/callback`（账号平台 OAuth 回跳，自带 state 常量时间比对）。
+
+其余 `/dsh-webui-oauth/*` 端点（status / audit / configure / disable / logout /
+oidc/bind / oidc/unbind / oidc/logout）保持「各 handler 自己 checkRequest」，
+不套通用闸门，避免改变其 JSON 错误语义。
+
+### 新增：部署方可追加公开路径
+
+机器调用的端点（例如签名校验的 GitHub webhook）需要匿名可达。在 dsh settings 里声明：
+
+```yaml
+remote-web-ui:
+  publicPaths:
+    - /api/webhooks/github      # 精确路径
+    - /api/webhooks/*           # 前缀（结尾 /*）
+```
+
+未声明的路径一律拒绝。配置热更新后下一次扫描（≤10s）生效，无需重启。
+
+### 可观测性
+
+`/dsh-webui-oauth/status` 的 `gate` 现在回显实际保护范围，便于运维核对，
+而不是只看到一句「闸门已开」：
+
+```json
+{
+  "gate": {
+    "ok": true,
+    "mode": "deny-by-default",
+    "stats": {
+      "wrappedExact": 8, "wrappedPrefix": 8,
+      "wrappedUpgrade": 1, "wrappedFallback": 1,
+      "publicPaths": ["/dsh-webui-oauth/login", "..."],
+      "exemptSelfGated": ["/dsh-webui-oauth/status", "..."]
+    }
+  }
+}
+```
+
+### 升级注意
+
+- 升级后**第三方插件的所有路由默认需要登录**。如果某个端点确实要匿名可达
+  （webhook、回调），请按上面的 `publicPaths` 显式声明，否则会 401。
+- 登录页、OIDC 往返、应用根的行为不变；实测登录 → 进应用 → 各插件功能均正常。
+
+### 测试
+
+- 新增 `test/gate-default-deny.test.mjs`（53 项）：锁定默认拒绝、白名单例外、
+  晚注册路由无窗口期、upgrade 与 fallback 覆盖、`undo` 完全可逆。
+- 真实实例端到端验证（dsh + `dsh-550c-boot` + `dsh-any-background` + 本插件）：
+  匿名访问上述三个端点由 200 变为 **401**，登录后仍 200/404（正常业务语义）。
+- 全量 17 个测试文件、434 项断言通过。
+
 ## 0.6.6
 
 对 **OIDC 授权跳转**做一次全量验证（固定路径 / 反代 / 浏览器动态三路），

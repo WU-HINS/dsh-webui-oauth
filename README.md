@@ -84,9 +84,15 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 | WebUI 资源（index.html、/assets/*、SPA 路由） | 插件注册 `prefix ''` 兜底路由，校验会话后转交 frontend-static | 302 → 登录页 |
 | 插件 bundle（/plugins/*） | 运行时包装 `/plugins` 前缀路由 handler | 401 |
 | /api RPC 接口 | 运行时包装 `/api` 前缀路由 handler | 401 |
-| WebSocket（`/api/remote.mux`；旧核心 `/api/events.mux`、`/api/events.host`） | 运行时包装 upgrade 路由 handler | 401 拒绝升级 |
+| **第三方插件的任意路由**（exact / prefix） | 默认拒绝：安装时枚举并包装**全部**路由，且接管路由表 `set` 在注册瞬间上闸门 | 401 |
+| WebSocket（**所有** upgrade 路由） | 运行时包装每个 upgrade handler | 401 拒绝升级 |
+| fallback（未被具名路由认领的请求） | 运行时包装 fallback handler | 401 |
 
-- **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
+> **0.6.7 起为「默认拒绝」白名单模型。** 此前只包 `/api` 与 `/plugins`，而 webServer 按「exact 优先、其次最长前缀」匹配——第三方插件注册的 `/dsh-any-background/font`、`/dsh-550c-boot/update` 等更具体的路由会抢在本插件的 `""` 前缀之前命中，完全绕过鉴权（实测未登录即 200 读出用户字体、壁纸与镜像指纹，而写端点因走 RPC 通道反而 401）。黑名单追不上新装的插件，白名单不会漏。
+>
+> **能匿名访问的完整清单**：`/dsh-webui-oauth/login`、`/setup`、`/oidc/login`、`/oidc/callback`、`/oauth/callback`。部署方可用 `remote-web-ui.publicPaths` 追加（见下）。
+
+- **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由；同时对 `exact/prefixes/upgrades` 三张表接管 `set`，**新路由注册的那一刻就上闸门**，不再有「装好插件到下一次重扫之间」的裸奔窗口。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
 - **fail-closed**：若预期路由缺失（dsh 内部结构变化导致包装不上），`setup`/`configure` 会**拒绝启用认证**，并在宿主日志与设置页同时报错——宁可不可用，不可「开了登录却裸奔 /api」。
 - **与核心自带浏览器认证（v0.1.2-alpha.2+）协作**：该版本核心自带 launch-token 交换的签名 Cookie（`dsh-auth-*`）认证 `/` 与 `/api`。插件登录成功后自动把浏览器引导到核心的带 token 根 URL 完成核心 Cookie 交换；`/api` 请求在插件会话校验后**原样转交**给核心（不再改写 Host/Origin，避免破坏核心 Cookie 与 Host 绑定）。两者叠加：浏览器须同时持有插件会话 Cookie 与核心 Cookie。
 - **反代/局域网旧核心下的特权方法**（≤alpha.1）：已认证请求由插件在会话校验后以「回环形状」转交核心，使核心中**回环钉死的特权方法**（settings/credentials/agentPreset/llm.discoverModels）在反代部署下可用——会话 Cookie 闸门是比 Host 启发式更强的身份证明。
@@ -110,6 +116,16 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
   | 3 | 否则（Host 已透传真实地址） | **按开关**：开 → 用请求 Host；关 → 用 `publicBaseUrl` |
 
   第 2 行是**动态跳转不可用时的兜底**，不是第二个开关：Host 被改写成回环时，服务端从请求里**拿不到**任何浏览器侧地址，开关即使开着也没有可用值，只能回退 `publicBaseUrl`（该值来自 `settings.yaml`，运维可控、非攻击者可控，不构成开放重定向）。
+
+- **追加公开路径（0.6.7，默认拒绝的配套开关）**：机器调用、无法携带浏览器会话的端点（GitHub webhook、第三方 OAuth 回跳等）必须显式声明，否则会被闸门 401。同一 settings 段：
+  ```yaml
+  remote-web-ui:
+    publicPaths:
+      - /api/webhooks/github     # 精确匹配
+      - /api/webhooks/*          # 前缀匹配（只认结尾的 /*）
+  ```
+  仅接受以 `/` 开头、不含空白与控制字符的绝对路径；未声明的路径一律拒绝。配置热更新后下一次扫描（≤10s）生效，无需重启。**内置白名单只有登录/OIDC 往返所必需的五条**，业务端点不应加进去，除非它自身已做签名/state 校验。
+
 
   **端口规则**：端口**只来自被选中那一方的字面**，不做任何补全。
   - 动态路径：端口取自 Host / 原始主机头。不带端口就不带（浏览器按 scheme 推 443）。

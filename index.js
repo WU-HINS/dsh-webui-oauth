@@ -127,11 +127,25 @@
  * and the scrypt credential format originate from Yuuz12/dsh-webui-auth
  * (MIT). This fork keeps the on-disk formats compatible where possible.
  *
- * Routes protected (all via runtime wrapping of the webServer service):
- *   - prefix ""    : SPA resources (302 to login page)
- *   - prefix "/plugins": client plugin bundles (302 to login page)
- *   - prefix "/api"     : RPC surface (401)
- *   - upgrades /api/remote.mux (+ legacy /api/events.mux, /api/events.host): (reject upgrade)
+ * Route gating (0.6.7+) — DENY BY DEFAULT, allowlist by exception:
+ *   Every route registered on the webServer is wrapped at registration time:
+ *     - all exact routes        -> 401 unless public / self-gated (below)
+ *     - all prefix routes       -> 401 unless the root "" prefix (ours) or public
+ *     - all upgrade (WebSocket) -> upgrade rejected with 401
+ *     - the fallback handler    -> 401 unless authenticated
+ *   Public allowlist (the minimum needed to log in):
+ *     /dsh-webui-oauth/login, /setup, /oidc/login, /oidc/callback, /oauth/callback
+ *   Self-gated (each handler calls checkRequest itself): the remaining
+ *     /dsh-webui-oauth/* endpoints.
+ *   Additional operator-declared public paths: settings remote-web-ui.publicPaths
+ *     (e.g. a signature-verified webhook ingress).
+ *
+ *   Why this replaced the old denylist: any third-party plugin could register a
+ *   more specific prefix/exact route (e.g. /dsh-any-background/font,
+ *   /dsh-550c-boot/update) that won the longest-prefix match and bypassed the
+ *   gate entirely — reads were anonymous while writes (over the connection RPC
+ *   channel) were 401: "write-protected, read-naked". A denylist can never keep
+ *   up with newly installed plugins; a default-deny allowlist cannot miss.
  *
  * Sessions: server-side, persisted across restarts (H3), carried by an
  * HttpOnly cookie `dsh_wua_session`; changing the password revokes every
@@ -200,7 +214,7 @@ async function dummyVerify(password) {
 }
 
 // 供测试与工具脚本使用（Cordis 加载时只消费 name/inject/apply，多余导出无副作用）
-export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath, sendJson, makeOidcStateStore, makeDiscoveryCache }
+export { hashPassword, verifyPassword, auditLog, readAuditEntries, resolveDataDirFrom, DATA_DIR, resolveRedirectScheme, postLoginRedirect, readOidcConfig, writeOidcConfig, configPath, oidcConfigPath, sendJson, makeOidcStateStore, makeDiscoveryCache, installRouteGate, PUBLIC_EXACT_PATHS, SELF_GATED_EXACT_PATHS }
 
 // ---------------- 数据目录与文件 ----------------
 
@@ -1014,8 +1028,104 @@ f.addEventListener('submit', function (ev) {
 const API_PREFIX = '/api'
 const PLUGINS_PREFIX = '/plugins'
 // alpha.2 起事件流 WebSocket 由 dsh-api-gateway 的 /api/remote.mux 承载；
-// 旧的 events.mux/events.host 已删除。候选列表按"存在即包装"，兼容新旧核心。
+// 旧的 events.mux/events.host 已删除。候选列表仅用于"核心事件流是否就位"的
+// fail-closed 判断；实际包装已改为**所有** upgrade 路由（见 installRouteGate）。
 const UPGRADE_CANDIDATES = ['/api/remote.mux', '/api/events.mux', '/api/events.host']
+
+// ---------------- 路由白名单（默认拒绝） ----------------
+//
+// 0.6.7 起，闸门由「只包 /api 与 /plugins 的黑名单」改为「默认拒绝一切、
+// 只放行白名单」的白名单模型。
+//
+// 为什么必须改：webServer 的匹配顺序是「exact 优先，其次最长前缀」。任何第三方
+// 插件都可以注册自己的 prefix/exact 路由（实测：/dsh-any-background/font、
+// /dsh-550c-boot/update），它们比本插件的 "" 前缀更具体，会抢在闸门之前命中，
+// 于是完全绕过鉴权——读接口 200 裸奔、写接口因为走 connection RPC 通道反而 401，
+// 形成典型的"写保护、读裸奔"。黑名单永远追不上新装的插件，白名单不会漏。
+//
+// 公开（允许匿名）的**精确路径**。只放行登录/OIDC 往返所必需的最小集合：
+// 少一条登录就进不去，多一条就可能泄露数据。新增请写进 remote-web-ui.publicPaths，
+// 不要直接改这里——部署差异不该进代码。
+const PUBLIC_EXACT_PATHS = new Set([
+  '/dsh-webui-oauth/login',        // 登录页 GET + 提交 POST
+  '/dsh-webui-oauth/setup',        // 首次初始化（由 setup token 把关）
+  '/dsh-webui-oauth/oidc/login',   // SSO 发起（未绑定时内部拒绝）
+  '/dsh-webui-oauth/oidc/callback',// IdP 回跳（state + PKCE + 验签把关）
+  '/oauth/callback',               // 账号平台的 OAuth 回跳（state 常量时间比对）
+])
+
+// 本插件自己注册的端点：内部**逐个**自带 checkRequest（公开的那几个按设计放行）。
+// 与 PUBLIC_EXACT_PATHS 分开列，是为了让"为什么不套通用闸门"有明确理由；
+// 也避免用 startsWith('/dsh-webui-oauth/') 这种宽豁免——那会让第三方注册的
+// /dsh-webui-oauth/xxx 搭便车。
+const SELF_GATED_EXACT_PATHS = new Set([
+  '/dsh-webui-oauth/login',
+  '/dsh-webui-oauth/setup',
+  '/dsh-webui-oauth/logout',
+  '/dsh-webui-oauth/status',
+  '/dsh-webui-oauth/audit',
+  '/dsh-webui-oauth/configure',
+  '/dsh-webui-oauth/disable',
+  '/dsh-webui-oauth/oidc/login',
+  '/dsh-webui-oauth/oidc/bind',
+  '/dsh-webui-oauth/oidc/unbind',
+  '/dsh-webui-oauth/oidc/callback',
+  '/dsh-webui-oauth/oidc/logout',
+])
+
+/**
+ * 读取部署方追加的公开路径（settings 的 remote-web-ui.publicPaths）。
+ *
+ * 形如 ['/api/webhooks/github'] 或 ['/api/webhooks/*']（结尾 /* 表示前缀）。
+ * 只接受以 / 开头、无空白与控制字符的绝对路径——避免把配置写成任意匹配。
+ *
+ * @param ctx 插件上下文
+ * @returns {string[]} 清洗后的模式列表
+ */
+function extraPublicPaths(ctx) {
+  const out = []
+  try {
+    const settings = ctx && typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+    const section = settings && typeof settings.get === 'function'
+      ? settings.get(PUBLIC_BASE_NAMESPACE)
+      : undefined
+    const raw = section && section.publicPaths
+    if (!Array.isArray(raw)) return out
+    for (const item of raw) {
+      if (typeof item !== 'string') continue
+      const p = item.trim()
+      if (!p.startsWith('/')) continue
+      if (/[\x00-\x1f\x7f\s]/.test(p)) continue
+      out.push(p)
+    }
+  } catch (e) { /* 配置不可读时按"没有额外放行"处理（更严格） */ }
+  return out
+}
+
+/**
+ * 判断路径是否命中公开模式。
+ * 模式以 '/*' 结尾表示前缀匹配（'/api/webhooks/*' 命中 '/api/webhooks/x' 与
+ * '/api/webhooks'），否则要求精确相等。
+ *
+ * @param path 请求/路由路径
+ * @param patterns 公开模式列表
+ * @returns {boolean}
+ */
+export function matchesPublicPath(path, patterns) {
+  const p = String(path || '')
+  for (const raw of patterns || []) {
+    const pat = String(raw || '')
+    if (!pat) continue
+    if (pat.endsWith('/*')) {
+      const base = pat.slice(0, -1)      // 保留结尾的 '/'
+      if (p === pat.slice(0, -2)) return true
+      if (p.startsWith(base)) return true
+    } else if (p === pat) {
+      return true
+    }
+  }
+  return false
+}
 
 function rejectUpgrade401(socket) {
   try {
@@ -1141,31 +1251,170 @@ function installRouteGate(ctx, checkRequest, log) {
     return () => { route.handler = original }
   }
 
-  // 已包装的路由打标记，避免重复包装
-  const wrapped = new WeakSet()
-  const PROTECTED_PREFIXES = [API_PREFIX, PLUGINS_PREFIX]
+  // 已包装的路由 → { kind, path, undo }。
+  // 用 Map 而不是 WeakSet，是为了支持"配置热更新后把已包的路由解包"：
+  // publicPaths 追加某路径后，该路径若之前已被包装，需要在下一次扫描时撤销，
+  // 否则文档里说的"无需重启生效"就不成立。
+  const wrappedRoutes = new Map()
+
+  // 部署方追加的公开路径（settings.remote-web-ui.publicPaths）。
+  // 每次扫描重读一次：配置热更新后无需重启即可生效。
+  let publicPatterns = extraPublicPaths(ctx)
+
+  // 当前生效的闸门策略快照，供 status 端点回显（便于运维核对"到底放行了什么"）。
+  // 计数在读取时从 wrappedRoutes 现算，避免 counters 与实际状态漂移；
+  // 豁免项用 Set 去重（scanOnce 每 2 秒跑一次，数组会无限增长）。
+  const stats = { publicPaths: new Set(), exemptPrefixes: new Set(), exemptSelfGated: new Set() }
+  let fallbackWrapped = false
+
+  /** 是否为公开路径：内置最小集合 + 部署方追加的模式。 */
+  const isPublicPath = (path) => PUBLIC_EXACT_PATHS.has(path) || matchesPublicPath(path, publicPatterns)
+
+  /** 精确路径/前缀是否属于本插件自管或已声明公开。 */
+  const isExemptHttp = (path, kind) => {
+    if (isPublicPath(path)) return true
+    if (kind === 'exact' && SELF_GATED_EXACT_PATHS.has(path)) return true
+    // 空前缀是本插件自己的传输层闸门（未登录时 302 到登录页）。
+    // 它不能套通用闸门，否则登录页永远打不开（401 死循环）。
+    if (kind === 'prefix' && path === '') return true
+    return false
+  }
+
+  /**
+   * 包一条 HTTP 路由（若它不在白名单里）。
+   * @returns {boolean} 本次是否真的包装了
+   */
+  const wrapRoute = (route, kind) => {
+    if (!route || typeof route !== 'object' || wrappedRoutes.has(route)) return false
+    if (typeof route.handler !== 'function') return false
+    const path = typeof route.path === 'string' ? route.path : ''
+    if (isExemptHttp(path, kind)) {
+      if (kind === 'prefix' && path === '') stats.exemptPrefixes.add('(root)')
+      else if (kind === 'exact' && !isPublicPath(path)) stats.exemptSelfGated.add(path)
+      return false
+    }
+    const undoFn = wrapHttp(route, { loopbackDeputy: kind === 'prefix' && path === API_PREFIX })
+    wrappedRoutes.set(route, { kind, path, undo: undoFn })
+    undos.push(undoFn)
+    log('wrapped ' + kind + ' route ' + (path === '' ? '(root)' : path))
+    return true
+  }
+
+  /** 包一条 upgrade 路由（WebSocket）。默认拒绝，不做白名单。 */
+  const wrapUpgradeRoute = (route) => {
+    if (!route || typeof route !== 'object' || wrappedRoutes.has(route)) return false
+    if (typeof route.handler !== 'function') return false
+    const undoFn = wrapUpgrade(route)
+    wrappedRoutes.set(route, { kind: 'upgrade', path: route.path || '', undo: undoFn })
+    undos.push(undoFn)
+    log('wrapped upgrade route ' + (route.path || '(unnamed)'))
+    return true
+  }
+
+  // ---------------- fallback 也要包 ----------------
+  // fallback 是"未被任何具名路由认领"的兜底处理器。它同样可能被第三方插件占据，
+  // 若不管，攻击者只要找到一个不存在的路径就可能落到未鉴权的 fallback 上。
+  const wrappedFallbacks = new WeakSet()
+  const gateFallback = (handler) => {
+    if (typeof handler !== 'function' || wrappedFallbacks.has(handler)) return handler
+    const original = handler
+    const gated = async (req, res) => {
+      if (!checkRequest(req)) {
+        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('unauthorized')
+        return
+      }
+      return original(req, res)
+    }
+    wrappedFallbacks.add(gated)
+    fallbackWrapped = true
+    log('wrapped fallback handler')
+    return gated
+  }
+
+  // 已经就位的 fallback：直接替换属性（保留原函数以便 undo）。
+  const wrapExistingFallback = () => {
+    const current = ws.fallback
+    if (typeof current !== 'function') return
+    if (wrappedFallbacks.has(current)) return
+    if (current.__dshWuaGated === true) return
+    const gated = gateFallback(current)
+    if (gated === current) return
+    gated.__dshWuaGated = true
+    ws.fallback = gated
+    undos.push(() => { if (ws.fallback === gated) ws.fallback = current })
+  }
+
+  // ---------------- 注册时即拦截（消除重扫窗口） ----------------
+  // 仅靠周期重扫会有最长 2s（降频后 10s）的"新路由尚未包装"窗口：插件热加载
+  // 后立刻被匿名访问就能漏过去。因此直接接管 Map#set，在注册的那一刻包装。
+  const interceptMapSet = (map, kind) => {
+    if (!map || typeof map.set !== 'function') return
+    const originalSet = map.set
+    map.set = function patchedSet (key, value) {
+      try { wrapRoute(value, kind) } catch (e) { /* 包装失败不阻断注册，靠重扫兜底 */ }
+      return originalSet.call(this, key, value)
+    }
+    undos.push(() => { map.set = originalSet })
+  }
+  interceptMapSet(ws.exact, 'exact')
+  interceptMapSet(ws.prefixes, 'prefix')
+
+  // upgrade 表同理：新注册的 WebSocket 路由也要在注册那一刻就上闸门。
+  if (ws.upgrades && typeof ws.upgrades.set === 'function') {
+    const originalUpgradeSet = ws.upgrades.set
+    ws.upgrades.set = function patchedUpgradeSet (key, value) {
+      try { wrapUpgradeRoute(value) } catch (e) { /* 靠重扫兜底 */ }
+      return originalUpgradeSet.call(this, key, value)
+    }
+    undos.push(() => { ws.upgrades.set = originalUpgradeSet })
+  }
+
+  // registerFallback 走的是属性赋值而非 Map，单独接管。
+  if (typeof ws.registerFallback === 'function') {
+    const originalRegisterFallback = ws.registerFallback
+    ws.registerFallback = function patchedRegisterFallback (handler) {
+      return originalRegisterFallback.call(this, gateFallback(handler))
+    }
+    undos.push(() => { ws.registerFallback = originalRegisterFallback })
+  }
+
   const scanOnce = () => {
     if (undone) return
-    for (const pfx of PROTECTED_PREFIXES) {
-      const route = ws.prefixes.get(pfx)
-      if (route !== undefined && !wrapped.has(route)) {
-        wrapped.add(route)
-        undos.push(wrapHttp(route, { loopbackDeputy: pfx === API_PREFIX }))
-        problems.delete(`prefix route "${pfx}" not registered yet`)
-        log(`wrapped prefix route ${pfx}`)
-      } else if (route === undefined) {
-        problems.add(`prefix route "${pfx}" not registered yet`)
-      }
+    publicPatterns = extraPublicPaths(ctx)
+    stats.publicPaths = new Set([...PUBLIC_EXACT_PATHS, ...publicPatterns])
+
+    // 配置热更新可能**新增**公开路径：已包装的对应路由必须解包，否则"无需重启
+    // 生效"是假的。只处理 HTTP 路由（upgrade 不做白名单）。
+    for (const [route, rec] of [...wrappedRoutes]) {
+      if (rec.kind === 'upgrade') continue
+      if (!isExemptHttp(rec.path, rec.kind)) continue
+      try { rec.undo() } catch (e) { /* ignore */ }
+      wrappedRoutes.delete(route)
+      log('unwrapped ' + rec.kind + ' route ' + (rec.path || '(root)') + ' (now public)')
     }
-    // alpha.2 起仅存在 /api/remote.mux（由 api-gateway 注册）；旧核心仍用
-    // events.mux/events.host。候选列表兼容两代：已注册的全部包装，其余不计问题。
-    for (const path of UPGRADE_CANDIDATES) {
-      const r = ws.upgrades.get(path)
-      if (r !== undefined && !wrapped.has(r)) {
-        wrapped.add(r)
-        undos.push(wrapUpgrade(r))
-        log(`wrapped upgrade route ${path}`)
-      }
+    // 快照一遍再遍历：包装过程中不改 Map，但注册可能并发发生（单线程下安全，
+    // 仍显式取快照以免迭代语义依赖实现细节）。
+    const exactEntries = ws.exact && typeof ws.exact.forEach === 'function' ? [...ws.exact] : []
+    for (const [, route] of exactEntries) wrapRoute(route, 'exact')
+
+    const prefixEntries = ws.prefixes && typeof ws.prefixes.forEach === 'function' ? [...ws.prefixes] : []
+    for (const [, route] of prefixEntries) wrapRoute(route, 'prefix')
+
+    // 所有 WebSocket upgrade 一律包装（不再只认 /api/remote.mux）：
+    // 第三方插件注册的 upgrade 同样可能暴露未鉴权的双向通道。
+    const upgradeEntries = ws.upgrades && typeof ws.upgrades.forEach === 'function' ? [...ws.upgrades] : []
+    for (const [, route] of upgradeEntries) wrapUpgradeRoute(route)
+
+    wrapExistingFallback()
+
+    // fail-closed 的判据：核心的 /api 与 /plugins 必须就位，否则说明路由形状
+    // 变了，"已启用"可能意味着裸奔。这里只保留这两条（以及事件流 upgrade），
+    // 不再把"只包了这两个"当成保护范围。
+    for (const pfx of [API_PREFIX, PLUGINS_PREFIX]) {
+      const route = ws.prefixes.get(pfx)
+      if (route === undefined) problems.add(`prefix route "${pfx}" not registered yet`)
+      else problems.delete(`prefix route "${pfx}" not registered yet`)
     }
     if (UPGRADE_CANDIDATES.every((path) => ws.upgrades.get(path) === undefined)) {
       problems.add('no upgrade route registered yet (looked for ' + UPGRADE_CANDIDATES.join(', ') + ')')
@@ -1208,7 +1457,33 @@ function installRouteGate(ctx, checkRequest, log) {
     undone = true
     for (const u of undos.splice(0).reverse()) { try { u() } catch (e) { /* ignore */ } }
   }
-  return { ok: () => problems.size === 0, problems: () => [...problems], undo }
+  return {
+    ok: () => problems.size === 0,
+    problems: () => [...problems],
+    // 供 status 端点回显：让运维能直接看到"包了几条、放行了什么"，
+    // 而不是只能相信"闸门开着"这句话。
+    stats: () => {
+      // 现算而非累加：解包/重包后计数不会漂移。
+      let exact = 0, prefix = 0, upgrade = 0
+      for (const rec of wrappedRoutes.values()) {
+        if (rec.kind === 'exact') exact += 1
+        else if (rec.kind === 'prefix') prefix += 1
+        else if (rec.kind === 'upgrade') upgrade += 1
+      }
+      return {
+        wrappedExact: exact,
+        wrappedPrefix: prefix,
+        wrappedUpgrade: upgrade,
+        wrappedFallback: fallbackWrapped ? 1 : 0,
+        publicPaths: [...stats.publicPaths].sort(),
+        exemptPrefixes: [...stats.exemptPrefixes].sort(),
+        exemptSelfGated: [...stats.exemptSelfGated].sort(),
+      }
+    },
+    // 立即重扫一次（配置变更后测试/运维可直接触发，不必等 2s 定时器）。
+    refresh: () => { scanOnce(); return { ok: problems.size === 0, problems: [...problems] } },
+    undo,
+  }
 }
 
 // ---------------- DSH 外观偏好 ----------------
@@ -2247,7 +2522,13 @@ export async function apply(ctx) {
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
-          gate: { ok: gate.ok(), problems: gate.problems().slice(0, 3) },
+          gate: {
+            ok: gate.ok(),
+            problems: gate.problems().slice(0, 3),
+            mode: 'deny-by-default',
+            // 让运维能核对"到底包了哪些、放行了哪些"，而不是只看一句"闸门已开"。
+            stats: gate.stats(),
+          },
           trustedOrigin: (() => {
             try {
               const pol = trustedOriginPolicy(ctx, oidcCfg)
