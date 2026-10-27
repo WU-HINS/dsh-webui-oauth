@@ -1200,26 +1200,35 @@ function installRouteGate(ctx, checkRequest, log) {
   const undos = []
   let undone = false
 
+  // alpha.2 起核心自带 Connection 浏览器认证（BrowserAuth + trusted-host fence）：
+  // /api handler 内建 requestRejection，且 browser cookie 按 Host authority 绑定 ——
+  // 再改写 Host/Origin 会破坏 cookie 匹配。仅旧核心（无 connection.requestRejection）
+  // 需要 loopback 伪装来通过 PRIVILEGED_METHODS fence。
+  //
+  // 【必须按请求判定，不能在包装时判定一次】。0.6.7 引入了"注册瞬间上闸门"
+  // （接管路由表的 set），这使得 /api 可能在 client-connection 服务尚未对本站
+  // 上下文可见时就被包装。若此时把 coreHasRequestGate 固化为 false，
+  // useDeputy 就永久为 true：之后每个 /api 请求都被改写成回环 Host，
+  // 而核心的 authority 绑定 Cookie 随之失配 —— 表现为"登录成功后 /api 恒 401"。
+  // 这是 0.6.7 的回归，改为每次请求现查即可消除对服务就绪时序的依赖。
+  const coreHasRequestGate = () => {
+    try {
+      const connection = ctx.get('connection')
+      return !!(connection && typeof connection.requestRejection === 'function')
+    } catch (e) {
+      return false
+    }
+  }
   const wrapHttp = (route, opts) => {
     const original = route.handler
     const loopbackDeputy = !!(opts && opts.loopbackDeputy)
-    // alpha.2 起核心自带 Connection 浏览器认证（BrowserAuth + trusted-host fence）：
-    // /api handler 内建 requestRejection，且 browser cookie 按 Host authority 绑定 ——
-    // 再改写 Host/Origin 会破坏 cookie 匹配。仅旧核心（无 connection.requestRejection）
-    // 需要 loopback 伪装来通过 PRIVILEGED_METHODS fence。
-    let coreHasRequestGate = false
-    try {
-      const connection = ctx.get('connection')
-      coreHasRequestGate = !!(connection && typeof connection.requestRejection === 'function')
-    } catch (e) { coreHasRequestGate = false }
-    const useDeputy = loopbackDeputy && !coreHasRequestGate
     const wrapped = async (req, res) => {
       if (!checkRequest(req)) {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('unauthorized')
         return
       }
-      if (useDeputy) {
+      if (loopbackDeputy && !coreHasRequestGate()) {
         // Authenticated + this is the /api surface on a legacy core: present the request
         // to the core as loopback so PRIVILEGED_METHODS' strict fence (settings.*,
         // credentials.*, agentPreset.*, llm.discoverModels) admits it. Our session gate

@@ -276,6 +276,97 @@ console.log('\n— 4b. 配置热更新（publicPaths 追加）—')
   gate.undo()
 }
 
+// ---------------- 4c. /api 的 loopback 伪装必须按请求判定 ----------------
+//
+// 回归（0.6.7 实测事故）：闸门接管了路由表的 set，会在路由"注册那一刻"包装。
+// 如果此时 client-connection 服务对本插件上下文尚不可见，包装时算出的
+// coreHasRequestGate=false 会被永久固化，之后每个 /api 请求都被改写成回环 Host；
+// 而 alpha.2+ 核心的浏览器 Cookie 按 authority 绑定，改写后必然失配 ——
+// 表现为"登录成功后 /api 恒 401"。修法：每次请求现查，不在包装时定死。
+console.log('\n— 4c. /api loopback 伪装：按请求判定，不固化 —')
+{
+  const ws = makeWebServer()
+  let seen = null
+  ws.prefixes.set('/api', {
+    kind: 'prefix',
+    path: '/api',
+    handler: async (req, res) => { seen = { ...req.headers }; res.writeHead(200); res.end('ok') },
+  })
+  ws.prefixes.set('/plugins', route('prefix', '/plugins'))
+  ws.upgrades.set('/api/remote.mux', route('upgrade', '/api/remote.mux'))
+
+  let connectionReady = false
+  const ctx = {
+    webServer: ws,
+    get(ns) {
+      if (ns === 'connection') {
+        return connectionReady
+          ? { requestRejection: () => undefined, authenticatedUrl: (b) => b }
+          : undefined
+      }
+      if (ns === 'settings') return { get: () => undefined }
+      return undefined
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  }
+
+  const gate = installRouteGate(ctx, () => true, () => {})
+  // 安装（并包装）之后，core 的 connection 服务才就绪
+  connectionReady = true
+
+  const req = {
+    method: 'POST',
+    url: '/api',
+    headers: { host: '127.0.0.1:13095', origin: 'http://127.0.0.1:13095', cookie: 'dsh_wua_session=x' },
+    socket: {},
+  }
+  const res = makeRes()
+  await ws.prefixes.get('/api').handler(req, res)
+  eq('服务就绪后不再改写 Host（否则 Cookie 失配 → 401）', seen.host, '127.0.0.1:13095')
+  eq('Origin 被保留', seen.origin, 'http://127.0.0.1:13095')
+  eq('请求正常放行', res.status, 200)
+
+  gate.undo()
+}
+
+// 旧核心（始终没有 requestRejection）仍然需要 loopback 伪装，不能被这次修复误伤
+console.log('\n— 4d. 旧核心仍保留 loopback 伪装 —')
+{
+  const ws = makeWebServer()
+  let seen = null
+  ws.prefixes.set('/api', {
+    kind: 'prefix',
+    path: '/api',
+    handler: async (req, res) => { seen = { ...req.headers }; res.writeHead(200); res.end('ok') },
+  })
+  ws.prefixes.set('/plugins', route('prefix', '/plugins'))
+  ws.upgrades.set('/api/remote.mux', route('upgrade', '/api/remote.mux'))
+
+  const ctx = {
+    webServer: ws,
+    get(ns) {
+      if (ns === 'settings') return { get: () => undefined }
+      return undefined          // 没有 connection 服务 = 旧核心
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  }
+
+  const gate = installRouteGate(ctx, () => true, () => {})
+  const req = {
+    method: 'POST',
+    url: '/api',
+    headers: { host: 'dsh.example.com', origin: 'https://dsh.example.com', cookie: 'x' },
+    socket: {},
+  }
+  const res = makeRes()
+  await ws.prefixes.get('/api').handler(req, res)
+  eq('旧核心：Host 改写成回环', seen.host, '127.0.0.1')
+  eq('旧核心：Origin 被移除', seen.origin, undefined)
+  eq('旧核心：请求放行', res.status, 200)
+
+  gate.undo()
+}
+
 // ---------------- 5. 卸载可逆 ----------------
 console.log('\n— 5. undo 必须完全可逆 —')
 {
