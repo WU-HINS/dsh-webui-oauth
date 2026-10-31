@@ -84,13 +84,15 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 | WebUI 资源（index.html、/assets/*、SPA 路由） | 插件注册 `prefix ''` 兜底路由，校验会话后转交 frontend-static | 302 → 登录页 |
 | 插件 bundle（/plugins/*） | 运行时包装 `/plugins` 前缀路由 handler | 401 |
 | /api RPC 接口 | 运行时包装 `/api` 前缀路由 handler | 401 |
-| **第三方插件的任意路由**（exact / prefix） | 默认拒绝：安装时枚举并包装**全部**路由，且接管路由表 `set` 在注册瞬间上闸门 | 401 |
+| **第三方插件的任意路由**（exact / prefix） | 默认拒绝：安装时枚举并包装**全部**路由，且接管路由表 `set` 在注册瞬间上闸门 | 页面导航 302 → 登录页；接口 401 |
 | WebSocket（**所有** upgrade 路由） | 运行时包装每个 upgrade handler | 401 拒绝升级 |
 | fallback（未被具名路由认领的请求） | 运行时包装 fallback handler | 401 |
 
 > **0.6.7 起为「默认拒绝」白名单模型。** 此前只包 `/api` 与 `/plugins`，而 webServer 按「exact 优先、其次最长前缀」匹配——第三方插件注册的 `/dsh-any-background/font`、`/dsh-550c-boot/update` 等更具体的路由会抢在本插件的 `""` 前缀之前命中，完全绕过鉴权（实测未登录即 200 读出用户字体、壁纸与镜像指纹，而写端点因走 RPC 通道反而 401）。黑名单追不上新装的插件，白名单不会漏。
 >
 > **能匿名访问的完整清单**：`/dsh-webui-oauth/login`、`/setup`、`/oidc/login`、`/oidc/callback`、`/oauth/callback`。部署方可用 `remote-web-ui.publicPaths` 追加（见下）。
+>
+> **会话失效时的行为**：浏览器直接导航（`Accept: text/html`）→ 302 回登录页；`fetch`/XHR 接口 → 401，由客户端插件拦截后跳登录页。已有有效会话再访问登录页 → 直接 302 回首页（带核心 launch token，顺带完成核心 Cookie 交换）。
 
 - **不修改核心包**：dsh 升级不会覆盖补丁、不会产生「升级后 /api 裸奔」的窗口。插件每次启动对路由表重做包装，并用 2s→10s 重扫捕获晚注册路由；同时对 `exact/prefixes/upgrades` 三张表接管 `set`，**新路由注册的那一刻就上闸门**，不再有「装好插件到下一次重扫之间」的裸奔窗口。**v0.1.2-alpha.2 及更新核心的事件流 WebSocket 位于 `/api/remote.mux`（由 dsh-api-gateway 注册），候选列表自动适配，不再误报「upgrade 路由缺失」。**
 - **fail-closed**：若预期路由缺失（dsh 内部结构变化导致包装不上），`setup`/`configure` 会**拒绝启用认证**，并在宿主日志与设置页同时报错——宁可不可用，不可「开了登录却裸奔 /api」。

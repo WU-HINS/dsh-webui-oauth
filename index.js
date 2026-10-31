@@ -1127,6 +1127,16 @@ export function matchesPublicPath(path, patterns) {
   return false
 }
 
+/** 该请求是否是一次浏览器导航（而不是 fetch/XHR 的接口调用）。 */
+function wantsHtml(req) {
+  try {
+    const accept = req && req.headers && req.headers.accept
+    return typeof accept === 'string' && accept.includes('text/html')
+  } catch (e) {
+    return false
+  }
+}
+
 function rejectUpgrade401(socket) {
   try {
     socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 13\r\n\r\nunauthorized\n')
@@ -1224,6 +1234,18 @@ function installRouteGate(ctx, checkRequest, log) {
     const loopbackDeputy = !!(opts && opts.loopbackDeputy)
     const wrapped = async (req, res) => {
       if (!checkRequest(req)) {
+        // 区分「浏览器导航」与「API 调用」：
+        //   - 面板/页面（GET/HEAD 且 Accept 含 text/html）→ 302 回登录页，
+        //     用户看到的是登录界面，而不是一个写着 unauthorized 的空白页；
+        //   - 接口（fetch/XHR、JSON）→ 仍返回 401，由前端决定怎么处理
+        //     （客户端插件会拦截 401 并跳登录）。
+        // 不区分会导致两种坏体验：页面变成裸文本，或 fetch 跟随 302 拿到 HTML
+        // 后 JSON 解析失败。
+        if ((req.method === 'GET' || req.method === 'HEAD') && wantsHtml(req)) {
+          res.writeHead(302, { location: '/dsh-webui-oauth/login', 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('unauthorized')
         return
@@ -2364,6 +2386,21 @@ export async function apply(ctx) {
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
           const credsNow = await readCredentials(ctx)
+          // 已有有效会话时，登录页不该再显示表单——直接送回首页。
+          //
+          // 用 postLoginRedirect() 而不是裸的 '/'：它会带上核心的 launch token，
+          // 顺带完成核心的 token→cookie 交换。否则只跳到 '/' 时，若核心 Cookie
+          // 已过期，会被核心再踢一次，用户看到"刚登录完好端端又回登录页"。
+          //
+          // 只在认证已启用时判断：首次初始化（enabledFlag=false）时 checkRequest
+          // 恒为 true，不能把首次访问的人也送回首页（那会 404/白屏）。
+          if (enabledFlag && checkRequest(req)) {
+            let target = '/'
+            try { target = postLoginRedirect(ctx, req) || '/' } catch (e) { target = '/' }
+            res.writeHead(302, { location: target, 'cache-control': 'no-store' })
+            res.end()
+            return
+          }
           const oidcOn = await oidcEnabled(credsNow)
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')

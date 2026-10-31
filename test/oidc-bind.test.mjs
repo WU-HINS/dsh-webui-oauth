@@ -335,6 +335,29 @@ console.log('\n— 1d. status 必须给出可抄进 IdP 的完整回调地址 �
     JSON.stringify(s2.json && s2.json.oidc && s2.json.oidc.redirectUri))
 }
 
+console.log('\n— 1e. 已有有效会话访问登录页 → 直接回首页 —')
+{
+  // 行为约定：
+  //   - 有有效会话：不再显示登录表单，302 回应用根（并带核心 launch token，
+  //     顺带完成核心的 token→cookie 交换，避免"刚回来又被踢"）；
+  //   - 无会话：照常渲染登录页。
+  const session = await loginLocal()
+  eq('本地登录成功（取得有效会话）', !!session, String(session))
+
+  const withSession = await call('/dsh-webui-oauth/login', {
+    url: '/dsh-webui-oauth/login',
+    headers: { cookie: 'dsh_wua_session=' + session },
+  })
+  eq('有会话时返回 302', withSession.status, 302)
+  eq('跳转目标是应用根并带 launch token',
+    String(withSession.location || '').includes('token='), String(withSession.location))
+
+  const withoutSession = await call('/dsh-webui-oauth/login', { url: '/dsh-webui-oauth/login' })
+  eq('无会话仍返回登录页', withoutSession.status, 200)
+  eq('是 HTML 登录页', typeof withoutSession.res.body === 'string' && withoutSession.res.body.includes('<form'),
+    String(withoutSession.res.body).slice(0, 40))
+}
+
 console.log('\n— 2. 绑定端点存在且要求已登录 —')
 {
   eq('注册了 /oidc/bind', routes.has('/dsh-webui-oauth/oidc/bind'))

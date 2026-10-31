@@ -84,13 +84,15 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
 | WebUI resources (index.html, /assets/*, SPA routes) | Plugin registers a `prefix ''` catch-all route; after session validation it hands off to frontend-static | 302 → login page |
 | Plugin bundles (/plugins/*) | Wraps the `/plugins` prefix route handler at runtime | 401 |
 | /api RPC surface | Wraps the `/api` prefix route handler at runtime | 401 |
-| **Any third-party plugin route** (exact / prefix) | Deny by default: every registered route is enumerated and wrapped, and each route table's `set` is intercepted so new routes are gated at registration time | 401 |
+| **Any third-party plugin route** (exact / prefix) | Deny by default: every registered route is enumerated and wrapped, and each route table's `set` is intercepted so new routes are gated at registration time | page navigation 302 → login; API 401 |
 | WebSocket (**all** upgrade routes) | Every upgrade handler is wrapped at runtime | 401 upgrade rejected |
 | fallback (requests claimed by no named route) | The fallback handler is wrapped too | 401 |
 
 > **Since 0.6.7 the gate is a deny-by-default allowlist.** Previously only `/api` and `/plugins` were wrapped, but the webServer matches "exact first, then longest prefix" — a third-party route such as `/dsh-any-background/font` or `/dsh-550c-boot/update` is more specific than this plugin's `""` prefix and therefore won the match, bypassing the gate entirely (measured: anonymous requests read user fonts, wallpapers and image fingerprints with 200, while write endpoints returned 401 because they go through the RPC channel — "write-protected, read-naked"). A denylist can never keep up with the next plugin you install; a default-deny allowlist cannot miss.
 >
 > **The complete anonymous allowlist**: `/dsh-webui-oauth/login`, `/setup`, `/oidc/login`, `/oidc/callback`, `/oauth/callback`. Operators can extend it via `remote-web-ui.publicPaths` (see below).
+>
+> **When the session is invalid**: a browser navigation (`Accept: text/html`) gets a 302 back to the login page; `fetch`/XHR calls get a 401, which the client plugin intercepts and turns into a redirect to the login page. Visiting the login page with a valid session redirects to the app root (carrying the core launch token, so the core cookie exchange still happens).
 
 - **No core patching**: a DSH upgrade never overwrites patches and never leaves `/api` exposed after an upgrade. Every startup re-wraps the route tables, with a 2s→10s rescan loop that catches late-registered routes; the `set` methods of `exact/prefixes/upgrades` are also intercepted, so **a newly registered route is gated the moment it is registered** — there is no longer a window between "plugin installed" and "next rescan". **On v0.1.2-alpha.2+ the event-stream WebSocket lives at `/api/remote.mux` (registered by dsh-api-gateway); the candidate list adapts automatically, so the plugin no longer falsely reports "upgrade route missing".**
 - **Fail-closed**: if the expected routes are missing (DSH internals changed so wrapping can't apply), `setup`/`configure` **refuse to enable authentication** and the problem is reported both in the host log and on the settings page — better unusable than "login enabled with an unprotected /api".

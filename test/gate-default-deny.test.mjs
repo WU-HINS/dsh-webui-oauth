@@ -178,6 +178,44 @@ console.log('\n— 2. 已注册的第三方读接口必须被默认拒绝 —')
   gate.undo()
 }
 
+// ---------------- 2b. 未认证时的响应形态：面板 302 / 接口 401 ----------------
+//
+// 同一个闸门要服务两类客户端：
+//   - 浏览器直接导航（Accept: text/html）→ 302 回登录页，用户看到登录界面；
+//   - fetch/XHR（JSON）→ 401，由前端决定跳转（客户端插件会拦截）。
+// 若一律 401，面板会变成写着 unauthorized 的空白页；若一律 302，
+// fetch 会跟随到 HTML，JSON 解析失败。
+console.log('\n— 2b. 未认证响应形态：页面跳登录、接口 401 —')
+{
+  const ws = makeWebServer()
+  const panel = route('exact', '/dsh-market/panel')
+  ws.exact.set(panel.path, panel)
+  ws.prefixes.set('/api', route('prefix', '/api'))
+  ws.prefixes.set('/plugins', route('prefix', '/plugins'))
+  ws.upgrades.set('/api/remote.mux', route('upgrade', '/api/remote.mux'))
+
+  const gate = installRouteGate(makeCtx(ws, undefined), checkRequest, () => {})
+
+  const htmlReq = {
+    method: 'GET', url: '/dsh-market/panel',
+    headers: { accept: 'text/html,application/xhtml+xml' }, socket: {},
+  }
+  const res1 = makeRes()
+  await panel.handler(htmlReq, res1)
+  eq('面板导航被 302 回登录页', res1.status, 302)
+  eq('Location 指向登录页', res1.headers.location, '/dsh-webui-oauth/login')
+
+  const apiReq = {
+    method: 'POST', url: '/api',
+    headers: { accept: 'application/json', 'content-type': 'application/json' }, socket: {},
+  }
+  const res2 = makeRes()
+  await ws.prefixes.get('/api').handler(apiReq, res2)
+  eq('接口调用仍返回 401（不跟随 302）', res2.status, 401)
+
+  gate.undo()
+}
+
 // ---------------- 3. 安装之后才注册的路由：注册即上闸门 ----------------
 console.log('\n— 3. 晚注册的路由不能有窗口期 —')
 {
