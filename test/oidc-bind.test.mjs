@@ -493,6 +493,87 @@ console.log('\n— 8. 旧凭据文件（无 boundSub）视为未绑定 —')
   eq('无 boundSub 的旧凭据拒绝 OIDC 登录', r.json && r.json.ok === false, r.res.body)
 }
 
+console.log('\n— 9. 「仅允许 SSO」：未绑定拒绝启用 / 已绑定后禁用密码登录 —')
+{
+  // 先回到"已配置 OIDC、尚未绑定"的基线
+  credsText = JSON.stringify({ ...baseCreds })
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+  })
+  const session = await loginLocal()
+  const H = { 'content-type': 'application/json', cookie: 'dsh_wua_session=' + session }
+  const base = { username: 'admin', current: 'pw12345678' }
+  const oidcCfg = (extra) => ({
+    enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+    redirectBase: 'https://webui.example.com', trustBrowserOrigin: false, ...extra,
+  })
+
+  // ① 未绑定：拒绝启用，避免把人锁在门外
+  const unbound = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: oidcCfg({ ssoOnly: true }) }),
+  })
+  eq('未绑定时拒绝启用仅允许 SSO', unbound.json && unbound.json.ok === false, unbound.res.body)
+  eq('拒绝原因明确', unbound.json && unbound.json.error === 'oidc-sso-only-unbound', unbound.res.body)
+
+  // ② 绑定后启用：接受，且绑定关系必须保留（回归：configure 曾把 boundSub 丢掉）
+  credsText = JSON.stringify({ ...baseCreds, boundSub: 'sub-alice' })
+  const enabledRes = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: oidcCfg({ ssoOnly: true }) }),
+  })
+  eq('已绑定时允许启用仅允许 SSO', enabledRes.json && enabledRes.json.ok === true, enabledRes.res.body)
+  const saved = JSON.parse(credsText || '{}')
+  eq('保存配置不得丢掉 boundSub', saved.boundSub, 'sub-alice')
+  eq('ssoOnly 已落盘', JSON.parse(oidcText || '{}').oidc.ssoOnly, true)
+
+  // 注意：此时密码登录已被禁用，不能再用 loginLocal() 取会话——
+  // 复用启用前那个会话（configure 会保留发起请求的会话）。
+  const st = await statusWith(session)
+  eq('status 回显 ssoOnly=true', st.json && st.json.oidc && st.json.oidc.ssoOnly === true, JSON.stringify(st.json && st.json.oidc))
+  eq('status 回显 ssoOnlyActive=true', st.json && st.json.oidc && st.json.oidc.ssoOnlyActive === true, JSON.stringify(st.json && st.json.oidc))
+
+  // ③ 未登录访问登录页 → 直接 302 到 SSO 入口（带 base，供 trustBrowserOrigin 使用）
+  const page = await call('/dsh-webui-oauth/login', { url: '/dsh-webui-oauth/login' })
+  eq('登录页被 302 到 SSO', page.status, 302, String(page.status))
+  const loc = String(page.location || '')
+  eq('跳转目标是 SSO 入口', loc.split('?')[0], '/dsh-webui-oauth/oidc/login', loc)
+  eq('带上浏览器侧 base', /[?&]base=/.test(loc), loc)
+
+  // ④ 密码登录接口被禁用（即使密码正确）
+  const pw = await call('/dsh-webui-oauth/login', {
+    url: '/dsh-webui-oauth/login', method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'pw12345678' }),
+  })
+  eq('密码登录被拒（403）', pw.status, 403, String(pw.status))
+  eq('错误码为 sso-only', pw.json && pw.json.error, 'sso-only')
+
+  // ⑤ 仅允许 SSO 时禁止解绑（否则会把所有人锁在门外）
+  const unbind = await call('/dsh-webui-oauth/oidc/unbind', {
+    url: '/dsh-webui-oauth/oidc/unbind', method: 'POST', headers: H,
+    body: JSON.stringify({ current: 'pw12345678' }),
+  })
+  eq('仅允许 SSO 时拒绝解绑', unbind.json && unbind.json.error, 'sso-only-active')
+  eq('绑定仍在', JSON.parse(credsText || '{}').boundSub, 'sub-alice')
+
+  // ⑥ 关闭开关后恢复密码登录
+  const off = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST', headers: H,
+    body: JSON.stringify({ ...base, oidc: oidcCfg({ ssoOnly: false }) }),
+  })
+  eq('可以关闭仅允许 SSO', off.json && off.json.ok === true, off.res.body)
+  const page2 = await call('/dsh-webui-oauth/login', { url: '/dsh-webui-oauth/login' })
+  eq('关闭后登录页恢复 200', page2.status, 200, String(page2.status))
+  const pw2 = await call('/dsh-webui-oauth/login', {
+    url: '/dsh-webui-oauth/login', method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: 'admin', password: 'pw12345678' }),
+  })
+  eq('关闭后密码登录恢复', pw2.json && pw2.json.ok === true, pw2.res.body)
+}
+
 globalThis.fetch = realFetch
 idp.close()
 rmSync(tmp, { recursive: true, force: true })

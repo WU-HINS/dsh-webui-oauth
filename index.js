@@ -919,7 +919,7 @@ const LOGIN_PAGE = `<!DOCTYPE html>
       <label for="t">初始化令牌（见 dsh 启动日志）</label>
       <input id="t" type="password" autocomplete="off" spellcheck="false">
     </div>
-    <label for="u">用户名</label>
+    <label for="u" id="ul">用户名</label>
     <input id="u" type="text" autocomplete="username" autofocus spellcheck="false">
     <label for="p" id="pl">密码</label>
     <input id="p" type="password" autocomplete="current-password">
@@ -939,8 +939,10 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 <script>
 var MODE = "__MODE__";
 var OIDC_ENABLED = "__OIDC_ENABLED__";
+var SSO_ONLY = "__SSO_ONLY__";
 var sub = document.getElementById('sub'), pl = document.getElementById('pl'), pc = document.getElementById('pc'), e = document.getElementById('e'),
   u = document.getElementById('u'), p = document.getElementById('p'), p2 = document.getElementById('p2'), b = document.getElementById('b'),
+  ul = document.getElementById('ul'),
   f = document.getElementById('f'), t = document.getElementById('t'), tokenrow = document.getElementById('tokenrow'),
   ssorow = document.getElementById('ssorow'), sso = document.getElementById('sso');
 function show(msg) { e.textContent = msg; e.style.display = 'block'; }
@@ -950,12 +952,27 @@ if (MODE === 'setup') {
   pl.textContent = '密码（至少 8 位，含大小写、数字、特殊符号）';
   pc.style.display = 'block';
   b.textContent = '创建账号';
+} else if (SSO_ONLY === 'true') {
+  sub.textContent = '此部署已启用「仅允许 SSO」，请使用 SSO 单点登录。';
 } else {
   sub.textContent = '此界面已启用身份认证，请登录后继续使用。';
 }
 // SSO 入口：仅登录模式且 OIDC 已配置时显示。跳转交给浏览器自身决定的重定向
 // （base 由 location.origin 上报；服务端 trustBrowserOrigin=true 时优先采信）。
 if (OIDC_ENABLED === 'true' && MODE === 'login') {
+  ssorow.style.display = 'block';
+}
+// 仅允许 SSO：把密码表单整体收起，只留 SSO 按钮。
+// 正常情况下服务端在 GET 阶段就 302 到 SSO 了，这里是兜底（例如配置刚改、
+// 页面被缓存，或用户手动回退到本页）。
+if (SSO_ONLY === 'true' && MODE === 'login') {
+  ul.style.display = 'none';
+  u.style.display = 'none';
+  pl.style.display = 'none';
+  p.style.display = 'none';
+  b.style.display = 'none';
+  tokenrow.style.display = 'none';
+  pc.style.display = 'none';
   ssorow.style.display = 'block';
 }
 if (sso) {
@@ -1204,7 +1221,18 @@ function detectOriginalPlugin(ctx) {
  * 检查读取。
  * @returns {{ ok: () => boolean, problems: () => string[], undo: () => void }}
  */
-function installRouteGate(ctx, checkRequest, log) {
+function installRouteGate(ctx, checkRequest, log, options) {
+  // 未登录时把浏览器送到哪里：默认密码登录页；「仅允许 SSO」时由调用方
+  // 传入的 loginLocation(req) 改送 SSO 入口（并带上浏览器侧 origin）。
+  const loginLocation = (req) => {
+    try {
+      if (options && typeof options.loginLocation === 'function') {
+        const target = options.loginLocation(req)
+        if (typeof target === 'string' && target) return target
+      }
+    } catch (e) { /* 回退到默认登录页 */ }
+    return LOGIN_PATH
+  }
   const ws = ctx.webServer
   const problems = new Set()
   const undos = []
@@ -1242,7 +1270,7 @@ function installRouteGate(ctx, checkRequest, log) {
         // 不区分会导致两种坏体验：页面变成裸文本，或 fetch 跟随 302 拿到 HTML
         // 后 JSON 解析失败。
         if ((req.method === 'GET' || req.method === 'HEAD') && wantsHtml(req)) {
-          res.writeHead(302, { location: '/dsh-webui-oauth/login', 'cache-control': 'no-store' })
+          res.writeHead(302, { location: loginLocation(req), 'cache-control': 'no-store' })
           res.end()
           return
         }
@@ -1746,6 +1774,9 @@ function postLoginRedirect(ctx, req) {
 //   - 审计只记录 sanitizeSub() 过滤后的 subject，杜绝注入。
 
 const OIDC_CALLBACK_PATH = '/dsh-webui-oauth/oidc/callback'
+// 登录入口。ssoOnly 开启时改走 SSO 入口——两者都是公开白名单路径。
+const LOGIN_PATH = '/dsh-webui-oauth/login'
+const SSO_LOGIN_PATH = '/dsh-webui-oauth/oidc/login'
 // 授权请求状态（state / nonce / PKCE verifier）的存活时间。三次握手应在分钟内
 // 完成，10 分钟足够覆盖用户在 IdP 侧慢慢登录的情形，又限制了被滥用的窗口。
 const OIDC_STATE_TTL_MS = 10 * 60 * 1000
@@ -2298,9 +2329,68 @@ export async function apply(ctx) {
     sessions.deleteAllExcept(keepToken)
   }
 
+  // ---------------- 「仅允许 SSO」 ----------------
+  //
+  // 生效条件（三者缺一不可）：
+  //   1) oidc.ssoOnly === true（部署者显式勾选）；
+  //   2) OIDC 已启用且 issuer/clientId/clientSecret 齐全；
+  //   3) 已绑定某个 IdP 身份。
+  //
+  // 第 3 条是**防锁死**的关键：配置为 ssoOnly 但绑定被移除（例如手工改了文件、
+  // 或旧版本留下的状态）时自动退回密码登录，绝不把唯一入口切成一个必然失败
+  // 的 SSO 跳转。
+  //
+  // 运行时值缓存起来：不在每个请求里读配置文件（那是同步/异步文件 IO），
+  // 由 apply、configure、unbind 以及后台定时器刷新。
+  let ssoOnlyActiveFlag = false
+
+  async function computeSsoOnly(creds) {
+    try {
+      const c = creds || await readCredentials(ctx)
+      const o = await oidcOf(c)
+      return !!(o && o.ssoOnly === true && o.enabled === true &&
+        typeof o.issuer === 'string' && typeof o.clientId === 'string' &&
+        typeof o.clientSecret === 'string' && isOidcBound(c))
+    } catch (e) {
+      return false
+    }
+  }
+  async function refreshSsoOnly(creds) {
+    ssoOnlyActiveFlag = await computeSsoOnly(creds)
+    return ssoOnlyActiveFlag
+  }
+
+  /** 本次请求的浏览器侧 origin（用于 SSO 入口的 base 参数）。 */
+  function requestOriginOf(req) {
+    try {
+      const headerHost = (req && req.headers && typeof req.headers.host === 'string' && req.headers.host.trim())
+        ? req.headers.host.trim()
+        : ''
+      const browserHost = proxyHost(req) || headerHost
+      if (!browserHost) return ''
+      const scheme = resolveRedirectScheme(ctx, req, browserHost)
+      return scheme + '://' + browserHost
+    } catch (e) {
+      return ''
+    }
+  }
+
+  /**
+   * 未登录时把浏览器送到哪个入口。
+   * ssoOnly 生效 → SSO 入口，并带上浏览器侧 origin（否则 trustBrowserOrigin
+   * 模式下服务端拿不到 base，会以 oidc-base-unresolvable 失败）。
+   */
+  function loginLocation(req) {
+    if (!ssoOnlyActiveFlag) return LOGIN_PATH
+    const origin = requestOriginOf(req)
+    return SSO_LOGIN_PATH + (origin ? '?base=' + encodeURIComponent(origin) : '')
+  }
+
   // H2: 安装运行时路由闸门
-  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-oauth] ' + m))
+  const gate = installRouteGate(ctx, checkRequest, (m) => ctx.logger.info('[dsh-webui-oauth] ' + m), { loginLocation })
   ctx.effect(() => gate.undo, 'dsh-webui-oauth: route gate')
+  // 启动时算一次（异步，不阻塞注册；默认 false 是安全的——最坏只是先显示密码页）
+  refreshSsoOnly().catch(() => {})
   if (!gate.ok()) {
     ctx.logger.error('[dsh-webui-oauth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
@@ -2332,6 +2422,8 @@ export async function apply(ctx) {
     try {
       const creds = await readCredentials(ctx)
       enabledFlag = isEnabled(creds)
+      // 配置可能被手工修改（含 ssoOnly / 绑定状态），定期重算生效值。
+      await refreshSsoOnly(creds)
     } catch (e) { /* keep last state */ }
   }, 60000)
   ctx.effect(() => () => clearInterval(bgTimer), 'dsh-webui-oauth: background timer')
@@ -2401,9 +2493,17 @@ export async function apply(ctx) {
             res.end()
             return
           }
+          // 「仅允许 SSO」：密码表单没有意义，直接送去 SSO 入口。
+          // 放在会话判断之后：已登录仍然优先回首页。
+          if (enabledFlag && ssoOnlyActiveFlag) {
+            res.writeHead(302, { location: loginLocation(req), 'cache-control': 'no-store' })
+            res.end()
+            return
+          }
           const oidcOn = await oidcEnabled(credsNow)
           const page = LOGIN_PAGE
             .replace('__MODE__', enabledFlag ? 'login' : 'setup')
+            .replace('__SSO_ONLY__', ssoOnlyActiveFlag ? 'true' : 'false')
             // SSO 按钮的显示条件 = 已配置 OIDC **且**已绑定身份。
             // 只判配置会让未绑定的部署显示一个点了必然被拒的按钮（oidc-not-bound），
             // 用户会以为坏了。绑定是访问前提，按钮就该跟着绑定状态走。
@@ -2426,6 +2526,22 @@ export async function apply(ctx) {
           if (body === null) return
           if (!enabledFlag) {
             sendJson(res, 200, { ok: false, error: 'not-configured' })
+            return
+          }
+          // 「仅允许 SSO」：密码登录接口一并关闭，避免绕过策略。
+          // 返回 403 + JSON（前端仍按 JSON 解析），并给出可读原因。
+          if (ssoOnlyActiveFlag) {
+            await auditLog(ctx, 'login_failure', {
+              username: String(body.username || '').trim() || null,
+              ip: requestMeta(req).ip,
+              ua: requestMeta(req).ua,
+              detail: '已启用「仅允许 SSO」，密码登录被拒绝',
+            })
+            sendJson(res, 403, {
+              ok: false,
+              error: 'sso-only',
+              hint: '此部署已启用「仅允许 SSO」，请使用 SSO 单点登录。',
+            })
             return
           }
           const username = String(body.username || '').trim()
@@ -2596,13 +2712,18 @@ export async function apply(ctx) {
                 boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null,
                 // prompt 是可选参数，回传当前值供设置页回显（缺省为空 = 不发送）。
                 prompt: typeof oidcCfg.prompt === 'string' ? oidcCfg.prompt : '',
+                // 「仅允许 SSO」：ssoOnly 是配置值，ssoOnlyActive 是**实际生效值**
+                // （还要求 OIDC 已启用且已绑定）。两者分开回显，便于排查
+                // "勾了但没生效"——通常是绑定被解除或 OIDC 参数不全。
+                ssoOnly: oidcCfg.ssoOnly === true,
+                ssoOnlyActive: ssoOnlyActiveFlag,
                 // 提供给 IdP 登记用的确切回调地址。原生 OIDC 要求 redirect_uri 精确匹配，
                 // 部署者必须把它抄进 IdP 的允许列表，因此这里直接算好给他。
                 // 不能只给路径：IdP 侧需要完整的 scheme + host + port。
                 redirectUri: resolveOidcRedirectUri(ctx, oidcCfg),
                 callbackPath: OIDC_CALLBACK_PATH,
               }
-            : { enabled: false, bound: isOidcBound(creds), boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null, redirectUri: null, callbackPath: OIDC_CALLBACK_PATH },
+            : { enabled: false, bound: isOidcBound(creds), boundSubHint: isOidcBound(creds) ? maskSubForDisplay(boundSubOf(creds)) : null, redirectUri: null, callbackPath: OIDC_CALLBACK_PATH, ssoOnly: false, ssoOnlyActive: false },
         })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -2718,6 +2839,39 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'clientSecret 须为字符串' })
             return
           }
+          // ssoOnly：「仅允许 SSO」。类型校验 + 防锁死校验。
+          // 勾选它等于关掉唯一的备用入口（密码登录），因此必须确认 SSO 这条路
+          // 真的能走通：OIDC 启用、参数齐全、且已经绑定了一个 IdP 身份。
+          // 否则用户会在下一次打开页面时被送进一个必然失败的 SSO 跳转。
+          if (oidcIn.ssoOnly !== undefined && typeof oidcIn.ssoOnly !== 'boolean') {
+            await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：ssoOnly 须为 boolean' })
+            sendJson(res, 200, { ok: false, error: 'oidc-invalid', reason: 'ssoOnly 须为 boolean' })
+            return
+          }
+          if (oidcIn.ssoOnly === true) {
+            if (oidcIn.enabled === false) {
+              await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：未启用 OIDC 时不能仅允许 SSO' })
+              sendJson(res, 200, { ok: false, error: 'oidc-sso-only-invalid', reason: '未启用 OIDC 时不能勾选「仅允许 SSO」' })
+              return
+            }
+            const prev = (await readOidcConfig(ctx, creds)).oidc
+            const prevSecret = (prev && typeof prev.clientSecret === 'string') ? prev.clientSecret : ''
+            const effectiveSecret = (typeof oidcIn.clientSecret === 'string' && oidcIn.clientSecret) ? oidcIn.clientSecret : prevSecret
+            if (!String(oidcIn.issuer || '').trim() || !String(oidcIn.clientId || '').trim() || !String(effectiveSecret || '').trim()) {
+              await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：仅允许 SSO 需先补全 OIDC 参数' })
+              sendJson(res, 200, { ok: false, error: 'oidc-sso-only-invalid', reason: '勾选「仅允许 SSO」前需先填写完整的 Issuer / Client ID / Client Secret' })
+              return
+            }
+            if (!isOidcBound(creds)) {
+              await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: 'OIDC 配置：仅允许 SSO 需先绑定身份' })
+              sendJson(res, 200, {
+                ok: false,
+                error: 'oidc-sso-only-unbound',
+                reason: '勾选「仅允许 SSO」前需要先在下方绑定 OIDC 身份，否则会把自己锁在门外',
+              })
+              return
+            }
+          }
           // 首次配置（尚无旧 secret）时必须提供：否则会存下一个没有 secret 的配置，
           // oidcEnabled() 判定为未启用，用户会看到莫名其妙的 oidc-not-configured。
           if (oidcIn.enabled === true && !String(oidcIn.clientSecret || '').trim()) {
@@ -2747,21 +2901,31 @@ export async function apply(ctx) {
             // prompt 默认不发（留空即 undefined）。仅在部署者显式填写时才带给 IdP，
             // 因为不少 IdP 会因不认识的 prompt 值直接拒绝授权。
             prompt: typeof oidcIn.prompt === 'string' && oidcIn.prompt.trim() ? oidcIn.prompt.trim() : undefined,
+            // 仅允许 SSO：显式存布尔值，便于设置页回显与运维手改。
+            ssoOnly: oidcIn.ssoOnly === true,
           }
         } else if (oidcIn && oidcIn.enabled === false) {
           oidcOut = { enabled: false }
         }
+        // 这里曾经只重建 { v, username, hash, ttl }，把 boundSub 一并丢掉——
+        // 结果是"每次保存设置都会静默解绑 OIDC"。绑定关系属于账号的一部分，
+        // 改密码/改 TTL 时没有理由动它，必须原样带过去。
+        const keptBoundSub = typeof creds.boundSub === 'string' && creds.boundSub ? creds.boundSub : null
         let credsOut
         if (keepPassword && typeof creds.hash === 'string') {
           credsOut = { v: 3, username, hash: creds.hash, ttl }
         } else {
           credsOut = { v: 3, username, hash: await hashPassword(password), ttl }
         }
+        if (keptBoundSub) credsOut.boundSub = keptBoundSub
         // 凭据文件只保留账号字段（OIDC 走独立文件）；写入时自然剥掉历史遗留的 oidc 段，
         // 完成旧布局 → 新布局迁移，不让旧 secret 继续躺在凭据文件里。
         await writeCredentials(ctx, credsOut)
         // OIDC 仅当本次请求涉及它时才写，避免"只改密码"把 OIDC 配置意外清掉。
         if (oidcOut) await writeOidcConfig(ctx, oidcOut)
+        // 配置可能改变了 ssoOnly / 绑定状态，立即重算生效值，
+        // 不必等后台定时器（否则用户保存后要最多 60 秒才看到效果）。
+        await refreshSsoOnly(credsOut)
         enabledFlag = true
         if (wasEnabled) {
           const keepToken = cookieOf(req, COOKIE_NAME)
@@ -2996,10 +3160,27 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: true, bound: false, alreadyUnbound: true })
           return
         }
+        // 仅允许 SSO 时禁止解绑：绑定是唯一入口，解绑等于把所有人锁在门外
+        // （此时密码登录已被禁用，且解绑后连 SSO 也会因未绑定而拒绝）。
+        // 要求先关闭开关，是有意的两步操作——不做静默降级，避免安全策略被
+        // 一个顺手点击悄悄改掉。
+        {
+          const cfg = await oidcOf(creds)
+          if (cfg && cfg.ssoOnly === true) {
+            await auditLog(ctx, 'oidc_unbind_failure', { username: creds.username, ip: meta.ip, ua: meta.ua, detail: '仅允许 SSO 生效时禁止解绑' })
+            sendJson(res, 200, {
+              ok: false,
+              error: 'sso-only-active',
+              hint: '请先在设置中关闭「仅允许 SSO」，再解除绑定。',
+            })
+            return
+          }
+        }
         // 只删 boundSub，其余字段原样保留。
         const next = { ...creds }
         delete next.boundSub
         await writeCredentials(ctx, next)
+        await refreshSsoOnly(next)
         await auditLog(ctx, 'oidc_unbind_success', { username: creds.username, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true, bound: false })
       } catch (e) {
@@ -3227,7 +3408,7 @@ export async function apply(ctx) {
           res.end()
           return
         }
-        res.writeHead(302, { location: '/dsh-webui-oauth/login' })
+        res.writeHead(302, { location: loginLocation(req) })
         res.end()
       } catch (e) {
         ctx.logger.warn('[dsh-webui-oauth] intercept error: ' + (e && e.message ? e.message : String(e)))
