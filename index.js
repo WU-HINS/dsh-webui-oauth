@@ -2155,6 +2155,20 @@ const OIDC_CALLBACK_PATH = '/dsh-webui-oauth/oidc/callback'
 // 登录入口。ssoOnly 开启时改走 SSO 入口——两者都是公开白名单路径。
 const LOGIN_PATH = '/dsh-webui-oauth/login'
 const SSO_LOGIN_PATH = '/dsh-webui-oauth/oidc/login'
+
+// SSO 复验弹窗的回调页：只负责通知 opener 并自我关闭，不加载整个应用。
+const REAUTH_POPUP_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>验证成功</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;background:#0b0b0c;color:#e8e8e8}
+  .box{text-align:center;opacity:.92}
+</style></head>
+<body><div class="box"><p>验证成功，正在返回设置页…</p><p style="font-size:12px;opacity:.6">如果窗口没有自动关闭，请手动关闭。</p></div>
+<script>
+try { if (window.opener) window.opener.postMessage({ type: 'dsh-wua-reauth', ok: true }, location.origin); } catch (e) {}
+setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
+</script></body></html>`
 // 授权请求状态（state / nonce / PKCE verifier）的存活时间。三次握手应在分钟内
 // 完成，10 分钟足够覆盖用户在 IdP 侧慢慢登录的情形，又限制了被滥用的窗口。
 const OIDC_STATE_TTL_MS = 10 * 60 * 1000
@@ -3519,7 +3533,13 @@ export async function apply(ctx) {
     // 复验要绑定到发起它的浏览器的**会话**：回调时直接把 reauthAt 记在该会话上，
     // 不再签发独立令牌、也不把令牌放进 URL。
     const sessionToken = purpose === 'reauth' ? cookieOf(req, COOKIE_NAME) : null
-    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose, sessionToken })
+    // 复验可以由设置页的弹窗发起（popup=1）：回调时回一个"验证成功，请关闭窗口"
+    // 的小页面，而不是把整个应用加载进弹窗。
+    let popup = false
+    try {
+      popup = purpose === 'reauth' && new URL(req.url || '/', 'http://x').searchParams.get('popup') === '1'
+    } catch (e) { popup = false }
+    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose, sessionToken, popup })
     const authUrl = new URL(disc.metadata.authorization_endpoint)
     authUrl.searchParams.set('response_type', 'code')
     authUrl.searchParams.set('client_id', o.clientId)
@@ -3824,6 +3844,17 @@ export async function apply(ctx) {
           }
           target.reauthAt = Date.now()
           await auditLog(ctx, 'oidc_reauth_success', { username: auditName, ip: meta.ip, ua: meta.ua })
+          // 弹窗发起：回一个自我关闭的页面，避免把整个应用加载进小窗口。
+          if (st.popup) {
+            res.writeHead(200, {
+              'content-type': 'text/html; charset=utf-8',
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+              'set-cookie': clearStateCookie['Set-Cookie'],
+            })
+            res.end(REAUTH_POPUP_HTML)
+            return
+          }
           redirectBackToApp(ctx, req, res, 'oidcreauth=1', clearStateCookie)
           return
         }
