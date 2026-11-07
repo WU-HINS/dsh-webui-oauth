@@ -1129,6 +1129,7 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oidc/reauth',
   '/dsh-webui-oauth/oauth-relay',
   '/dsh-webui-oauth/remote-trust',
+  '/dsh-webui-oauth/sessions/revoke',
 ])
 
 /**
@@ -3128,6 +3129,53 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-oauth: logout')
+
+  // 吊销所有其他浏览器会话：POST /dsh-webui-oauth/sessions/revoke
+  //
+  // 与「保存配置」同一套验证（当前密码或 2 分钟内的 SSO 复验）。
+  // 保留发起请求的当前会话，避免用户点一下就把自己踢回登录页；
+  // 想连当前会话一起退出，用「退出登录」。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/sessions/revoke',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const creds = await readCredentials(ctx)
+        const current = String(body.current || '')
+        const reauthOk = sessionReauthOk(req)
+        const curValid = reauthOk || (current && creds && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
+        if (!curValid) {
+          const meta = requestMeta(req)
+          await auditLog(ctx, 'sessions_revoke_failure', { username: creds && creds.username ? creds.username : null, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
+          sendJson(res, 200, { ok: false, error: 'current-invalid' })
+          return
+        }
+        let before = 0
+        for (const _ of sessions.live) before += 1
+        const keep = cookieOf(req, COOKIE_NAME)
+        destroyAllSessionsExcept(keep)
+        let after = 0
+        for (const _ of sessions.live) after += 1
+        const revoked = Math.max(0, before - after)
+        clearSessionReauth(req)
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'sessions_revoked', { username: creds.username, ip: meta.ip, ua: meta.ua, detail: '吊销 ' + revoked + ' 个其他会话' })
+        sendJson(res, 200, { ok: true, revoked })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: revoke sessions')
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',

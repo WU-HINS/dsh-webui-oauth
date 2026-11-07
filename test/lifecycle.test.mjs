@@ -158,6 +158,32 @@ try {
   eq('登录下发新会话', !!login.cookie, true)
   const s2 = login.cookie
 
+  console.log('\n— 3b. 吊销所有其他浏览器会话 —')
+  const login2 = await call('/dsh-webui-oauth/login', {
+    url: '/dsh-webui-oauth/login', method: 'POST', headers: jsonHeaders(),
+    body: JSON.stringify({ username: 'admin', password: 'Admin#Passw0rd!' }),
+  })
+  const sExtra = login2.cookie
+  eq('再建立一个会话', !!sExtra, true)
+
+  const revokeBad = await call('/dsh-webui-oauth/sessions/revoke', {
+    url: '/dsh-webui-oauth/sessions/revoke', method: 'POST', headers: jsonHeaders(s2),
+    body: JSON.stringify({ current: 'wrong' }),
+  })
+  eq('错误密码不能吊销', revokeBad.json && revokeBad.json.error, 'current-invalid')
+
+  const revoke = await call('/dsh-webui-oauth/sessions/revoke', {
+    url: '/dsh-webui-oauth/sessions/revoke', method: 'POST', headers: jsonHeaders(s2),
+    body: JSON.stringify({ current: 'Admin#Passw0rd!' }),
+  })
+  eq('吊销成功', revoke.json && revoke.json.ok, true, revoke.res.body)
+  eq('至少吊销一个其他会话', revoke.json && revoke.json.revoked >= 1, true)
+
+  const otherSt = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + sExtra } })
+  eq('其他会话已失效（401）', otherSt.status, 401, String(otherSt.status))
+  const keepSt = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + s2 } })
+  eq('当前会话保持有效', keepSt.status, 200, String(keepSt.status))
+
   console.log('\n— 4. 修改配置（当前密码验证 + TTL）—')
   const conf = await call('/dsh-webui-oauth/configure', {
     url: '/dsh-webui-oauth/configure', method: 'POST', headers: jsonHeaders(s2),
