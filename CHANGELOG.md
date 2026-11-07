@@ -2,6 +2,44 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.7.3
+
+整合 `dsh-remote-trust`，并确认与官方 DeepSeek 账号登录（0.2.1+）的兼容边界。
+
+### 新增：远程访问信任（可选内置，原 `dsh-remote-trust`）
+
+经域名反代访问时，客户端把页面判为"非 loopback"，设置 → 模型报
+`settings are unavailable in this browser`。开启：
+
+```yaml
+remote-web-ui:
+  trustRemoteHost: true
+```
+
+- 通过官方 `webServer.tapIndex` 注入 `__DSH_TRANSPORT__.ownsHost = true`；
+- 注入**幂等**：与 `dsh-remote-trust` 同时安装不会重复；
+- `tapIndex` 不存在时只记一条 warn 并返回 false，插件其余功能照常（版本兼容）；
+- `status` 回显 `remoteTrust`；
+- 安全边界：只应在页面已由本插件保护时启用；不改变服务端信任护栏，
+  仍需 `--trusted-host <对外域名>`。
+
+### 兼容：官方 DeepSeek 账号登录（0.2.1+）
+
+- `/oauth/callback` 保持公开，包括**登录开始时才动态注册**的那一次（新增回归断言）；
+- 上游 `deepseek-account-platform` 的 `loginOrigin()` 只接受
+  `http://localhost|127.0.0.1|[::1]:<port>`，**不支持反代域名**——这是上游设计限制，
+  与插件无关；
+- 文档补充：本机 `http://127.0.0.1:3080` 完成一次登录后，账号 token 保存在 Host
+  凭证里，之后经域名访问仍然有效；
+- 刻意不 monkey-patch 核心内部函数（升级即碎），需要域名直登请推动上游放宽。
+
+### 测试
+
+- 新增 `test/remote-trust.test.mjs`（21 项）：注入幂等、配置读取、`tapIndex` 缺失降级、
+  与 `dsh-remote-trust` 共存；
+- `test/gate-default-deny.test.mjs` 新增 2 项：晚注册的 `/oauth/callback` 仍保持公开；
+- 全量 21 个测试文件、558 项断言通过。
+
 ## 0.7.2
 
 合并上游（Yuuz12/dsh-webui-auth）0.3.5–0.3.7 中**可安全合并**的部分；

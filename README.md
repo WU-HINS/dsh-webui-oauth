@@ -119,6 +119,14 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
   第 2 行是**动态跳转不可用时的兜底**，不是第二个开关：Host 被改写成回环时，服务端从请求里**拿不到**任何浏览器侧地址，开关即使开着也没有可用值，只能回退 `publicBaseUrl`（该值来自 `settings.yaml`，运维可控、非攻击者可控，不构成开放重定向）。
 
+
+- **远程访问信任（0.7.3，原 `dsh-remote-trust` 的可选内置）**：经域名反代访问时，客户端会把页面判为"非 loopback"，设置 → 模型会报 `settings are unavailable in this browser`。开启下面这一项即可（等价于安装 `dsh-remote-trust`，但不需要额外插件）：
+  ```yaml
+  remote-web-ui:
+    trustRemoteHost: true
+  ```
+  它通过官方 `webServer.tapIndex` 往 index.html 注入 `__DSH_TRANSPORT__.ownsHost = true`；注入幂等，与 `dsh-remote-trust` 同时安装也不会重复。`tapIndex` 不存在时只记一条 warn，插件其余功能照常（版本兼容）。
+  **安全边界**：该声明会把页面当作"可信本机"，同时放开其他以 `isLoopback` 为条件的本机专属客户端表面；只应在页面已由本插件保护时启用，且服务端仍需 `--trusted-host <对外域名>`（它不改变服务端信任护栏）。
 - **追加公开路径（0.6.7，默认拒绝的配套开关）**：机器调用、无法携带浏览器会话的端点（GitHub webhook、第三方 OAuth 回跳等）必须显式声明，否则会被闸门 401。同一 settings 段：
   ```yaml
   remote-web-ui:
@@ -411,6 +419,10 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
 ## 已知边界
 
+- **DeepSeek 官方账号登录（0.2.1+）**：本插件已把 `/oauth/callback` 放进公开白名单（包括登录开始时才**动态注册**的那一次），匿名回调不会被闸门拦截。但上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` **只接受** `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），明确不支持反代域名。因此：
+  - 本机 `http://127.0.0.1:3080` 访问：官方登录可正常走完；
+  - 经域名访问：点登录会以 `protocol` 错失败（这是上游设计限制，与插件无关）。可先用 `http://127.0.0.1:3080` 或 SSH 本地转发完成一次登录——账号 token 保存在 Host 凭证里，之后经域名访问仍然有效；
+  - 若要在域名下直接登录，需要上游放开该限制（或自行 fork 账号平台）。本插件不会 monkey-patch 核心内部函数，以避免升级即碎。
 - **DSH Desktop**：支持 `dsh-desktop-*` 标记透传（登录 / 退出后重登不再丢失标记），但**不提供**上游 0.3.6 的「宿主载体桥」。该桥只用 socket 是否回环来判定，而本部署是 nginx 同机反代——所有请求的 socket 都是 `127.0.0.1`，启用它等于"持有核心 Cookie 即可绕过插件会话 / SSO"，与「仅允许 SSO」冲突。若必须使用 DSH Desktop 的 shell 直连模式，请改用上游原版插件，并自行评估该旁路风险。
 - **审计日志字段类型**：0.7.2 起 `null` 与 boolean 原样写入（不再变成字符串 `"null"` / `"true"`）；旧日志解析代码若假设"所有字段都是字符串"，需相应调整。
 - **dsh 0.2.2-rc.1 的 fallback 形状**：该版本起 `webServer.fallback` 可能是 `{ resource }`（`dsh-host-frontend-static` 就是这样注册的），而不再是函数。插件已兼容函数 / `{ resource }` / `{ handler }` 三种形状；资源型 fallback 同样会被闸门包装。若升级后 `/` 返回 `500` 且 body 为空（nginx 日志 `500 0`），请确认插件版本 ≥ 0.7.1。

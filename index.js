@@ -1151,6 +1151,71 @@ export function matchesPublicPath(path, patterns) {
   return false
 }
 
+// ---------------- 远程访问信任（原 dsh-remote-trust 的可选内置） ----------------
+//
+// 背景：dsh-client-connection 用 `__DSH_TRANSPORT__.ownsHost === true` 或页面 hostname
+// 是否回环来判定"可信本机"；dsh-client-ui-settings 据此决定设置镜像的持久化模式。
+// 经域名反代访问（非 loopback）时页面被判为不可信，设置 → 模型会报
+// "settings are unavailable in this browser"。
+//
+// 官方逃生通道是 index.html 里的 `__DSH_TRANSPORT__.ownsHost = true`。这里内置同样的
+// 注入，默认**关闭**，由部署方显式开启：
+//
+//   remote-web-ui:
+//     trustRemoteHost: true
+//
+// 安全边界：该声明会让页面被当作"可信本机"，同时放开其他以 isLoopback 为条件的
+// 本机专属客户端表面。因此只应在页面已由本插件（会话 + 可选 SSO）保护时启用；
+// 它不改变服务端信任护栏（/api 仍是 loopback ∪ --trusted-host）。
+const REMOTE_TRUST_SCRIPT =
+  '<script>globalThis.__DSH_TRANSPORT__=Object.assign({},globalThis.__DSH_TRANSPORT__,{ownsHost:true});</script>'
+
+/**
+ * index.html 变换：注入 ownsHost 声明。幂等（已有 ownsHost 则原样返回），
+ * 缺 </head> 时也原样返回——绝不因为页面形状变化把 index 弄坏。
+ * 与 dsh-remote-trust 同时安装时不会重复注入（同一幂等判据）。
+ */
+export function injectRemoteTrust(html) {
+  if (typeof html !== 'string') return html
+  if (html.includes('ownsHost')) return html
+  return html.replace('</head>', REMOTE_TRUST_SCRIPT + '</head>')
+}
+
+/** 读取 remote-web-ui.trustRemoteHost（默认 false）。 */
+export function remoteTrustEnabled(ctx) {
+  try {
+    const settings = ctx && typeof ctx.get === 'function' ? ctx.get('settings') : undefined
+    const section = settings && typeof settings.get === 'function'
+      ? settings.get(PUBLIC_BASE_NAMESPACE)
+      : undefined
+    return !!(section && section.trustRemoteHost === true)
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * 按配置安装 index 变换。
+ * 版本兼容：tapIndex 不存在时记一条 warn 并返回 false，绝不抛异常
+ * （上游若改动该内部 API，插件其余功能必须照常工作）。
+ *
+ * @returns {boolean} 是否已安装
+ */
+export function installRemoteTrust(ctx) {
+  if (!remoteTrustEnabled(ctx)) return false
+  const ws = ctx && ctx.webServer
+  if (!ws || typeof ws.tapIndex !== 'function') {
+    try { ctx.logger.warn('[dsh-webui-oauth] remote-web-ui.trustRemoteHost 已启用，但 webServer.tapIndex 不可用；未注入 ownsHost') } catch (e) { /* ignore */ }
+    return false
+  }
+  const off = ws.tapIndex(injectRemoteTrust)
+  try {
+    if (typeof ctx.effect === 'function') ctx.effect(() => off, 'dsh-webui-oauth: remote trust index tap')
+  } catch (e) { /* ignore */ }
+  try { ctx.logger.info('[dsh-webui-oauth] remote trust index tap registered (__DSH_TRANSPORT__.ownsHost = true)') } catch (e) { /* ignore */ }
+  return true
+}
+
 /** 该请求是否是一次浏览器导航（而不是 fetch/XHR 的接口调用）。 */
 function wantsHtml(req) {
   try {
@@ -2562,6 +2627,9 @@ export async function apply(ctx) {
   ctx.effect(() => gate.undo, 'dsh-webui-oauth: route gate')
   // 启动时算一次（异步，不阻塞注册；默认 false 是安全的——最坏只是先显示密码页）
   refreshSsoOnly().catch(() => {})
+
+  // 远程访问信任（可选）：反代域名下让设置页可用。默认关闭；tapIndex 缺失时安全降级。
+  installRemoteTrust(ctx)
   if (!gate.ok()) {
     ctx.logger.error('[dsh-webui-oauth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
@@ -2867,6 +2935,8 @@ export async function apply(ctx) {
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
+          // 远程访问信任（可选）：是否按 remote-web-ui.trustRemoteHost 注入了 ownsHost。
+          remoteTrust: remoteTrustEnabled(ctx),
           // 核心兜底席位形态（handler | resource | absent | unknown）：核心升级后
           // 如果这里变成 unknown，文档请求会 404 —— 排查时先看这个字段。
           fallback: fallbackShape(ctx.webServer),

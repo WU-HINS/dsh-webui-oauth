@@ -108,7 +108,23 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
   ```
   - `trustBrowserOrigin` defaults to `true` when omitted (legacy behavior); an explicit `false` makes both sites **ignore** the browser-influenced origin and use `publicBaseUrl`. With no `publicBaseUrl` either, the token redirect falls back to the request Host / loopback, and OIDC fails closed with an error.
   - The old `oidc.trustBrowserOrigin` is still accepted: when the settings section does not set the switch explicitly, it is used as the fallback, so existing deployments migrate smoothly.
-  - **Extra public paths (0.6.7, the companion switch for deny-by-default)**: endpoints called by machines that cannot carry a browser session (GitHub webhooks, third-party OAuth callbacks) must be declared explicitly, otherwise the gate answers 401. Same settings section:
+  
+- **Remote-access trust (0.7.3, optional built-in equivalent of `dsh-remote-trust`)**: when the page is
+  reached through a domain reverse proxy, the client treats it as non-loopback and Settings → Models
+  reports `settings are unavailable in this browser`. Enable:
+  ```yaml
+  remote-web-ui:
+    trustRemoteHost: true
+  ```
+  It injects `__DSH_TRANSPORT__.ownsHost = true` into index.html through the official
+  `webServer.tapIndex`; the injection is idempotent, so installing `dsh-remote-trust` as well does not
+  duplicate it. If `tapIndex` is unavailable it only logs a warning and everything else keeps working
+  (version compatibility).
+  **Security boundary**: the declaration marks the page as a "trusted local" surface and also opens
+  other client-side features gated on `isLoopback`; enable it only when the page is already protected
+  by this plugin. It does not change the server-side trust fence, so `--trusted-host <public host>` is
+  still required.
+- **Extra public paths (0.6.7, the companion switch for deny-by-default)**: endpoints called by machines that cannot carry a browser session (GitHub webhooks, third-party OAuth callbacks) must be declared explicitly, otherwise the gate answers 401. Same settings section:
     ```yaml
     remote-web-ui:
       publicPaths:
@@ -401,6 +417,19 @@ wired into `npm test`).
 
 ## Known limits
 
+- **DeepSeek official account login (0.2.1+)**: `/oauth/callback` is on the public allowlist
+  (including the route registered dynamically when a login starts), so the anonymous callback is never
+  blocked by the gate. However, upstream `@deepseek-ai/dsh-deepseek-account-platform`'s
+  `loginOrigin()` **only accepts** `http://localhost:<port>`, `http://127.0.0.1:<port>` and
+  `http://[::1]:<port>` with an explicit non-zero port; reverse-proxied domains are explicitly
+  unsupported. Therefore:
+  - via `http://127.0.0.1:3080` the official login completes normally;
+  - via a domain it fails with a `protocol` error (upstream limitation, not this plugin). Complete the
+    login once through `http://127.0.0.1:3080` or an SSH local forward — the account token is stored in
+    the host credential store and keeps working through the domain afterwards;
+  - logging in directly on a domain requires upstream to relax that rule (or a fork of the account
+    platform). This plugin deliberately does not monkey-patch core internals, which would break on
+    every upgrade.
 - **DSH Desktop**: `dsh-desktop-*` marker pass-through is supported (markers survive login and
   re-login), but upstream 0.3.6's **host carrier bridge is intentionally not included**. That bridge
   decides "loopback" purely from the socket address, and this deployment sits behind an nginx proxy on

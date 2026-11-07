@@ -216,6 +216,31 @@ console.log('\n— 2b. 未认证响应形态：页面跳登录、接口 401 —'
   gate.undo()
 }
 
+// ---------------- 2c. 官方 DeepSeek 登录的回调：晚注册也必须保持公开 ----------------
+//
+// deepseek-account-platform 在**用户点击登录时**才注册 /oauth/callback（exact）。
+// 它必须在白名单里，否则匿名回调会被 401 拦掉，官方登录必然失败。
+console.log('\n— 2c. 官方登录回调（晚注册）保持公开 —')
+{
+  const ws = makeWebServer()
+  ws.prefixes.set('/api', route('prefix', '/api'))
+  ws.prefixes.set('/plugins', route('prefix', '/plugins'))
+  ws.upgrades.set('/api/remote.mux', route('upgrade', '/api/remote.mux'))
+
+  const gate = installRouteGate(makeCtx(ws, undefined), checkRequest, () => {})
+
+  // 模拟登录开始时动态注册
+  const cb = route('exact', '/oauth/callback')
+  ws.exact.set(cb.path, cb)          // 走被接管的 Map#set
+
+  const res = makeRes()
+  await cb.handler(anon(), res)
+  eq('晚注册的 /oauth/callback 不要求会话', res.status, 200)
+  eq('未被计入已包装路由', gate.stats().wrappedExact, 0)
+
+  gate.undo()
+}
+
 // ---------------- 3. 安装之后才注册的路由：注册即上闸门 ----------------
 console.log('\n— 3. 晚注册的路由不能有窗口期 —')
 {
