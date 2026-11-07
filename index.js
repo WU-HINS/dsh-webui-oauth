@@ -949,7 +949,15 @@ class PersistentDevices {
       try { ev = JSON.parse(line) } catch (e) { continue }
       if (!ev || typeof ev.op !== 'string') continue
       if (ev.op === 'add' && ev.dev && typeof ev.dev === 'object' && typeof ev.dev.id === 'string') {
-        this.live.set(ev.dev.id, { ...ev.dev })
+        this.live.set(ev.dev.id, {
+          ...ev.dev,
+          description: typeof ev.dev.description === 'string' ? ev.dev.description : '',
+          lastIp: typeof ev.dev.lastIp === 'string' ? ev.dev.lastIp : null,
+          lastUa: typeof ev.dev.lastUa === 'string' ? ev.dev.lastUa : null,
+          os: typeof ev.dev.os === 'string' ? ev.dev.os : '',
+          browser: typeof ev.dev.browser === 'string' ? ev.dev.browser : '',
+          device: typeof ev.dev.device === 'string' ? ev.dev.device : '',
+        })
       } else if (ev.op === 'revoke' && typeof ev.id === 'string') {
         const d = this.live.get(ev.id)
         if (d) d.revokedAt = Number(ev.at) || Date.now()
@@ -982,17 +990,23 @@ class PersistentDevices {
     } catch (e) { /* 压缩失败不影响运行 */ }
   }
 
-  add({ name, hash, clientId, scope }) {
+  add({ name, description, hash, clientId, scope }) {
     const id = randomBytes(8).toString('hex')
     const now = Date.now()
     const rec = {
       id,
       name: String(name || '设备').slice(0, 60),
+      description: String(description || '').slice(0, 160),
       hash,
       clientId: String(clientId || ''),
       scope: String(scope || 'dsh'),
       createdAt: now,
       lastUsedAt: 0,
+      lastIp: null,
+      lastUa: null,
+      os: '',
+      browser: '',
+      device: '',
     }
     this.live.set(id, rec)
     this.append({ op: 'add', dev: rec })
@@ -1012,13 +1026,13 @@ class PersistentDevices {
     return null
   }
 
-  touch(dev) {
+  touch(dev, force) {
     const now = Date.now()
     dev.lastUsedAt = now
-    // 每次请求都写盘会放大 IO：最多每分钟落一次 touch
-    if (now - (dev.persistedAt || 0) >= 60000) {
+    // 每次请求都写盘会放大 IO：最多每分钟落一次；UA/IP 变化时立即落。
+    if (force || now - (dev.persistedAt || 0) >= 60000) {
       dev.persistedAt = now
-      this.append({ op: 'touch', id: dev.id, at: now })
+      this.append({ op: 'add', dev })
     }
   }
 
@@ -1037,10 +1051,17 @@ class PersistentDevices {
       out.push({
         id: dev.id,
         name: dev.name,
+        description: dev.description || '',
         clientId: dev.clientId,
         scope: dev.scope,
         createdAt: dev.createdAt,
         lastUsedAt: dev.lastUsedAt,
+        lastIp: dev.lastIp || null,
+        lastUa: dev.lastUa || null,
+        os: dev.os || '',
+        browser: dev.browser || '',
+        device: dev.device || '',
+        fingerprint: sessionFingerprint({ ua: dev.lastUa, ip: dev.lastIp }),
       })
     }
     out.sort((a, b) => b.createdAt - a.createdAt)
@@ -1200,6 +1221,24 @@ function deviceApprovalPage(userCode) {
     ok.disabled = true; no.disabled = true;
     m.textContent = '处理中…';
     try {
+      // 批准前先看应用声明：让用户知道自己在批准哪个应用。
+      if (decision === 'approve') {
+        try {
+          var infoRes = await fetch('/dsh-webui-oauth/device/inspect', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ user_code: document.getElementById('c').value })
+          });
+          if (infoRes.status === 401) { goLogin(); return; }
+          var info = await infoRes.json();
+          if (info && info.ok) {
+            var label = info.app + (info.description ? '（' + info.description + '）' : '');
+            if (!window.confirm('应用「' + label + '」请求访问此 DSH，是否批准？')) {
+              m.textContent = '已取消';
+              return;
+            }
+          }
+        } catch (e) { /* inspect 失败不阻断批准 */ }
+      }
       var res = await fetch('/dsh-webui-oauth/device/approve', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ user_code: document.getElementById('c').value, action: decision })
@@ -1512,6 +1551,7 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/sessions/revoke-one',
   '/dsh-webui-oauth/sessions',
   '/dsh-webui-oauth/device/approve',
+  '/dsh-webui-oauth/device/inspect',
   '/dsh-webui-oauth/device/core-session',
   '/dsh-webui-oauth/devices',
   '/dsh-webui-oauth/devices/revoke',
@@ -3138,7 +3178,16 @@ export async function apply(ctx) {
     if (bearer) {
       const dev = devices.findByToken(bearer)
       if (!dev) return false
-      devices.touch(dev)
+      // 设备会话同样以当前 HTTP 请求实时刷新来源信息（IP / UA / 系统 / 浏览器）。
+      const meta = requestMeta(req)
+      const parsed = describeUserAgent(meta.ua)
+      const changed = dev.lastIp !== meta.ip || dev.lastUa !== meta.ua
+      dev.lastIp = meta.ip
+      dev.lastUa = meta.ua
+      dev.os = parsed.os
+      dev.browser = parsed.browser
+      dev.device = parsed.device
+      devices.touch(dev, changed)
       return true
     }
     const token = cookieOf(req, COOKIE_NAME)
@@ -3149,10 +3198,20 @@ export async function apply(ctx) {
       sessions.delete(token)
       return false
     }
+    // 浏览器标识以**当前 HTTP 请求**为准，实时刷新（UA / IP / 系统 / 浏览器 / 设备）。
+    // 落盘做节流：UA/IP 变化立即写，否则每分钟一次，避免每个静态资源请求都写盘。
     const now = Date.now()
-    // 最近活跃时间：每分钟最多落盘一次，供会话列表展示。
-    if (now - (s.lastSeenAt || 0) > 60000) {
-      s.lastSeenAt = now
+    const meta = requestMeta(req)
+    const parsed = describeUserAgent(meta.ua)
+    const changed = s.ip !== meta.ip || s.ua !== meta.ua
+    s.lastSeenAt = now
+    s.ip = meta.ip
+    s.ua = meta.ua
+    s.os = parsed.os
+    s.browserName = parsed.browser
+    s.device = parsed.device
+    if (changed || now - (s.persistedAt || 0) > 60000) {
+      s.persistedAt = now
       sessions.append({ op: 'add', token, sess: s })
     }
     if (s.browser === true) s.expiresAt = now + SESSION_TTL_MS
@@ -3785,15 +3844,25 @@ export async function apply(ctx) {
           sendJson(res, 429, { error: 'temporarily_unavailable' })
           return
         }
+        // 设备授权必须声明"是什么应用"：名称进入待批准记录与设备列表。
+        const name = String(body.client_name || body.app_name || '').trim().slice(0, 60)
+        if (!name) {
+          sendJson(res, 400, {
+            error: 'invalid_request',
+            error_description: 'client_name 必填：设备授权需要在申请时声明应用名称',
+          })
+          return
+        }
+        const description = String(body.client_description || body.app_description || '').trim().slice(0, 160)
         const deviceCode = randomBytes(32).toString('hex')
         const userCode = makeUserCode()
         const scope = String(body.scope || 'dsh').slice(0, 80)
-        const name = String(body.client_name || body.name || '').trim().slice(0, 60) || 'App'
         pendingDevices.set(deviceCode, {
           userCode,
           clientId,
           scope,
           name,
+          description,
           expiresAt: now + DEVICE_CODE_TTL_MS,
           interval: DEVICE_INTERVAL_S,
           lastPollAt: 0,
@@ -3863,7 +3932,13 @@ export async function apply(ctx) {
         // 单次发放：同一个 device_code 只能换一次 token。
         const token = randomBytes(32).toString('hex')
         const hash = createHash('sha256').update(token).digest('hex')
-        const rec = devices.add({ name: pending.name, hash, clientId: pending.clientId, scope: pending.scope })
+        const rec = devices.add({
+          name: pending.name,
+          description: pending.description,
+          hash,
+          clientId: pending.clientId,
+          scope: pending.scope,
+        })
         pending.issued = true
         pendingDevices.delete(code)
         const meta = requestMeta(req)
@@ -3956,6 +4031,48 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-oauth: device approve')
+
+  // 批准前查看待授权应用的声明（仅浏览器会话）
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device/inspect',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (enabledFlag && !sessionOf(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const wanted = normalizeUserCode(body.user_code)
+        let entry = null
+        for (const pending of pendingDevices.values()) {
+          if (pending.userCode.replace('-', '') === wanted) { entry = pending; break }
+        }
+        if (!entry) {
+          sendJson(res, 200, { ok: false, error: 'invalid-code' })
+          return
+        }
+        if (entry.expiresAt <= Date.now()) {
+          sendJson(res, 200, { ok: false, error: 'expired' })
+          return
+        }
+        sendJson(res, 200, {
+          ok: true,
+          app: entry.name,
+          description: entry.description || '',
+          client_id: entry.clientId,
+          scope: entry.scope,
+        })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device inspect')
 
   // 设备会话列表 / 吊销（浏览器会话）
   ctx.effect(() => ctx.webServer.register({

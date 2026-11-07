@@ -73,6 +73,7 @@ function makeReq(url, headers = {}, body) {
   const req = {
     method: 'GET', url,
     headers: { host: '127.0.0.1:3080', 'user-agent': 'device-test', ...headers },
+    socket: { remoteAddress: '203.0.113.9' },
     on(ev, fn) { if (!listeners.has(ev)) listeners.set(ev, []); listeners.get(ev).push(fn); return req },
   }
   if (body !== undefined) {
@@ -124,9 +125,16 @@ try {
   eq('浏览器会话已建立', !!browserSession, true)
 
   console.log('\n— 1. 设备发起授权 —')
+  {
+    const noName = await call('/dsh-webui-oauth/device/authorize', {
+      url: '/dsh-webui-oauth/device/authorize', method: 'POST', headers: jsonHeaders(),
+      body: JSON.stringify({ client_id: 'dsh-app', scope: 'dsh' }),
+    })
+    eq('未声明应用名称被拒', noName.json && noName.json.error, 'invalid_request')
+  }
   const authz = await call('/dsh-webui-oauth/device/authorize', {
     url: '/dsh-webui-oauth/device/authorize', method: 'POST', headers: jsonHeaders(),
-    body: JSON.stringify({ client_id: 'dsh-app', client_name: 'dsh-Go', scope: 'dsh' }),
+    body: JSON.stringify({ client_id: 'dsh-app', client_name: 'dsh-Go', client_description: 'Flutter 客户端', scope: 'dsh' }),
   })
   eq('authorize 成功', authz.json && typeof authz.json.device_code, 'string')
   eq('返回 user_code', typeof (authz.json && authz.json.user_code), 'string')
@@ -142,6 +150,19 @@ try {
   eq('返回 authorization_pending', pending.json && pending.json.error, 'authorization_pending')
 
   console.log('\n— 3. 浏览器批准 —')
+  {
+    const anonInspect = await call('/dsh-webui-oauth/device/inspect', {
+      url: '/dsh-webui-oauth/device/inspect', method: 'POST', headers: jsonHeaders(),
+      body: JSON.stringify({ user_code: userCode }),
+    })
+    eq('未登录不能查看应用声明（401）', anonInspect.status, 401)
+    const inspect = await call('/dsh-webui-oauth/device/inspect', {
+      url: '/dsh-webui-oauth/device/inspect', method: 'POST', headers: jsonHeaders(browserSession),
+      body: JSON.stringify({ user_code: userCode }),
+    })
+    eq('批准页能看到应用名称', inspect.json && inspect.json.app, 'dsh-Go')
+    eq('批准页能看到应用说明', inspect.json && inspect.json.description, 'Flutter 客户端')
+  }
   const anonApprove = await call('/dsh-webui-oauth/device/approve', {
     url: '/dsh-webui-oauth/device/approve', method: 'POST', headers: jsonHeaders(),
     body: JSON.stringify({ user_code: userCode, action: 'approve' }),
@@ -171,6 +192,10 @@ try {
   console.log('\n— 6. 设备列表 —')
   const list = await call('/dsh-webui-oauth/devices', { headers: { cookie: 'dsh_wua_session=' + browserSession } })
   eq('列表包含 dsh-Go', list.json && list.json.devices && list.json.devices[0] && list.json.devices[0].name, 'dsh-Go')
+  eq('保留应用说明', list.json && list.json.devices[0] && list.json.devices[0].description, 'Flutter 客户端')
+  eq('记录 HTTP 来源 IP', list.json && list.json.devices[0] && list.json.devices[0].lastIp, '203.0.113.9')
+  eq('记录 HTTP 系统字段', typeof (list.json && list.json.devices[0] && list.json.devices[0].os), 'string')
+  eq('记录 HTTP 指纹', /^[0-9a-f]{12}$/.test(String(list.json && list.json.devices[0] && list.json.devices[0].fingerprint)), true)
   const deviceId = list.json.devices[0].id
 
   console.log('\n— 6b. 核心 launch Cookie 桥 —')

@@ -205,6 +205,16 @@ try {
     const other = list.json && list.json.sessions.find((x) => !x.current)
     eq('会话带系统字段', typeof (other && other.os), 'string')
     eq('会话带指纹字段', typeof (other && other.fingerprint), 'string')
+
+    // 浏览器标识以 HTTP 请求为准：同一会话换一个 UA 发请求，列表应立即反映。
+    const chromeUa = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+    await call('/dsh-webui-oauth/status', {
+      headers: { cookie: 'dsh_wua_session=' + s2, 'user-agent': chromeUa },
+    })
+    const list2 = await call('/dsh-webui-oauth/sessions', { headers: { cookie: 'dsh_wua_session=' + s2 } })
+    const current = list2.json && list2.json.sessions.find((x) => x.current)
+    eq('浏览器标识实时更新', current && current.browser, 'Chrome 130')
+    eq('系统标识实时更新', current && current.os, 'Linux')
     if (other) {
       const revokeOne = await call('/dsh-webui-oauth/sessions/revoke-one', {
         url: '/dsh-webui-oauth/sessions/revoke-one', method: 'POST', headers: jsonHeaders(s2),

@@ -423,6 +423,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 给没有浏览器 Cookie 的客户端（dsh-Go 等 App、CLI）使用的第二套凭据。流程遵循 RFC 8628，**无回调**：
 
 1. `POST /dsh-webui-oauth/device/authorize`（公开）→ `device_code`、`user_code`、`verification_uri`；
+   **必须带 `client_name` 声明应用**（可选 `client_description`），否则返回 `invalid_request`；
 2. 用户在浏览器打开 `verification_uri`；未登录会自动跳转登录页（密码或 SSO），
    登录成功后回到批准页并保留 `user_code`，再批准（或拒绝）；
 3. `POST /dsh-webui-oauth/device/token`（公开）轮询 → `access_token`（Bearer）。
@@ -430,9 +431,11 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 设备会话与浏览器会话**完全独立**：
 
 - 单独存放于 `devices.jsonl`，只存 token 的 SHA-256；
+- 记录**申请时声明的应用名称/说明**，以及每次 Bearer 请求的 IP、UA、系统、浏览器、指纹；
 - **没有过期时间**，只有显式吊销（`POST /dsh-webui-oauth/devices/revoke`）才失效；
 - 设置页「设备会话（App / CLI）」单独列表，可逐个吊销；
 - 浏览器会话也有独立列表（系统 / 浏览器 / 设备指纹 / 最近活跃），可单独吊销；
+  标识按**每个 HTTP 请求**实时刷新，不是登录时的快照；
 - 设备 Bearer 直接通过 `checkRequest`，可访问 `/api`、`/plugins`、WebSocket 与静态资源；
 - 设备 Bearer **不能**做设备管理（列表 / 吊销 / 批准新设备只允许浏览器会话）。
 
