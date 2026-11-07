@@ -600,6 +600,38 @@ console.log('\n— 5d. SSO 复验弹窗：回调返回自我关闭页面 —')
   eq('会话已标记复验', st.json && st.json.reauthActive === true, JSON.stringify(st.json && st.json.reauthActive))
 }
 
+console.log('\n— 5e. OIDC 绑定弹窗：回调返回自我关闭页面 —')
+{
+  credsText = JSON.stringify(baseCreds)
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+  })
+  const session = await loginLocal()
+  const H = { cookie: 'dsh_wua_session=' + session }
+
+  const bindRes = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/bind').handler(
+    makeReq('/dsh-webui-oauth/oidc/bind?popup=1', H), bindRes)
+  eq('绑定弹窗 302 到 IdP', bindRes.status, 302, String(bindRes.status))
+  const authUrl = new URL(bindRes.headers.location)
+  const stCookie = getCookie(bindRes, 'dsh_wua_oidc_state') || authUrl.searchParams.get('state')
+
+  idpState.sub = 'sub-alice'
+  const authRes = await fetch(authUrl.href, { redirect: 'manual' })
+  const back = new URL(authRes.headers.get('location'))
+  const cb = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/callback').handler(
+    makeReq('/dsh-webui-oauth/oidc/callback?' + back.searchParams.toString(),
+      { cookie: 'dsh_wua_oidc_state=' + stCookie }), cb)
+
+  eq('绑定弹窗回调返回 200 HTML', cb.status, 200, String(cb.status))
+  eq('页面通知 opener（dsh-wua-bound）', String(cb.body).includes('dsh-wua-bound'), true)
+  eq('页面尝试关闭自身', String(cb.body).includes('window.close'), true)
+  const st = await statusWith(session)
+  eq('绑定已落库', st.json && st.json.oidc && st.json.oidc.bound, true)
+}
+
 console.log('\n— 6. 解绑：密码错误被拒，正确则清空并立即失效 —')
 {
   const bad = await call('/dsh-webui-oauth/oidc/unbind', {

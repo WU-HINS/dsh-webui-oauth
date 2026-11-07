@@ -423,7 +423,8 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 给没有浏览器 Cookie 的客户端（dsh-Go 等 App、CLI）使用的第二套凭据。流程遵循 RFC 8628，**无回调**：
 
 1. `POST /dsh-webui-oauth/device/authorize`（公开）→ `device_code`、`user_code`、`verification_uri`；
-2. 用户在浏览器打开 `verification_uri`，登录后输入 `user_code` 批准（或拒绝）；
+2. 用户在浏览器打开 `verification_uri`；未登录会自动跳转登录页（密码或 SSO），
+   登录成功后回到批准页并保留 `user_code`，再批准（或拒绝）；
 3. `POST /dsh-webui-oauth/device/token`（公开）轮询 → `access_token`（Bearer）。
 
 设备会话与浏览器会话**完全独立**：
@@ -431,6 +432,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 - 单独存放于 `devices.jsonl`，只存 token 的 SHA-256；
 - **没有过期时间**，只有显式吊销（`POST /dsh-webui-oauth/devices/revoke`）才失效；
 - 设置页「设备会话（App / CLI）」单独列表，可逐个吊销；
+- 浏览器会话也有独立列表（系统 / 浏览器 / 设备指纹 / 最近活跃），可单独吊销；
 - 设备 Bearer 直接通过 `checkRequest`，可访问 `/api`、`/plugins`、WebSocket 与静态资源；
 - 设备 Bearer **不能**做设备管理（列表 / 吊销 / 批准新设备只允许浏览器会话）。
 
@@ -448,7 +450,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 - **DeepSeek 官方账号登录（0.2.1+，远程回调中转）**：`/oauth/callback` **不是公开路径**，仍受会话闸门保护。上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` 只接受 `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），不支持反代域名。插件的处理方式：
   - 劫持官方登录的 `callbackOrigin`：本地回环访问保留原 origin（cookie 同 host，回调直接命中）；域名访问改写成 `http://127.0.0.1:<本机端口>`；
   - 浏览器授权后会被跳到这个回环回调地址——远程机器上通常打不开，但地址栏里有完整 URL；
-  - 官方「等待登录」窗口里会直接出现一个回调粘贴框（插件用 MutationObserver 注入到该对话框内，不单独占一个悬浮入口）；把地址栏 URL 粘贴进去，插件在服务端**内部重放**给账号平台注册的 `/oauth/callback` handler（state + PKCE 仍由平台校验），完成换 token；
+  - 点击官方「登录」时会打开 `/dsh-webui-oauth/relay-window` 子窗口（类似 SSO 验证弹窗）；授权后把地址栏 URL 粘贴进去，插件在服务端**内部重放**给账号平台注册的 `/oauth/callback` handler（state + PKCE 仍由平台校验），完成换 token；「等待登录」对话框内的粘贴框保留为兜底；
   - 中转端点要求插件会话，且只接受本机端口的 `/oauth/callback` + 单个 `code`/`state`（防 SSRF / 开放重定向）；
   - 本机 `http://127.0.0.1:3080` 访问时官方登录原本就能直接走完，无需中转。
 - **DSH Desktop**：支持 `dsh-desktop-*` 标记透传（登录 / 退出后重登不再丢失标记），但**不提供**上游 0.3.6 的「宿主载体桥」。该桥只用 socket 是否回环来判定，而本部署是 nginx 同机反代——所有请求的 socket 都是 `127.0.0.1`，启用它等于"持有核心 Cookie 即可绕过插件会话 / SSO"，与「仅允许 SSO」冲突。若必须使用 DSH Desktop 的 shell 直连模式，请改用上游原版插件，并自行评估该旁路风险。

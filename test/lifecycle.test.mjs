@@ -184,6 +184,36 @@ try {
   const keepSt = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + s2 } })
   eq('当前会话保持有效', keepSt.status, 200, String(keepSt.status))
 
+  console.log('\n— 3c. 登录 next 回跳与会话列表 —')
+  {
+    const nextLogin = await call('/dsh-webui-oauth/login', {
+      url: '/dsh-webui-oauth/login', method: 'POST', headers: jsonHeaders(),
+      body: JSON.stringify({ username: 'admin', password: 'Admin#Passw0rd!', next: '/dsh-webui-oauth/device?user_code=AB12-CD34' }),
+    })
+    eq('登录回跳 next', nextLogin.json && nextLogin.json.redirect, '/dsh-webui-oauth/device?user_code=AB12-CD34')
+
+    const badNext = await call('/dsh-webui-oauth/login', {
+      url: '/dsh-webui-oauth/login', method: 'POST', headers: jsonHeaders(),
+      body: JSON.stringify({ username: 'admin', password: 'Admin#Passw0rd!', next: '//evil.example/' }),
+    })
+    eq('拒绝协议相对 next', badNext.json && badNext.json.redirect === '//evil.example/', false)
+
+    const list = await call('/dsh-webui-oauth/sessions', { headers: { cookie: 'dsh_wua_session=' + s2 } })
+    eq('会话列表可用', list.json && list.json.ok, true)
+    eq('列表包含会话', list.json && list.json.sessions.length >= 2, true)
+    eq('标记了当前会话', list.json && list.json.sessions.some((x) => x.current), true)
+    const other = list.json && list.json.sessions.find((x) => !x.current)
+    eq('会话带系统字段', typeof (other && other.os), 'string')
+    eq('会话带指纹字段', typeof (other && other.fingerprint), 'string')
+    if (other) {
+      const revokeOne = await call('/dsh-webui-oauth/sessions/revoke-one', {
+        url: '/dsh-webui-oauth/sessions/revoke-one', method: 'POST', headers: jsonHeaders(s2),
+        body: JSON.stringify({ id: other.id }),
+      })
+      eq('单条吊销成功', revokeOne.json && revokeOne.json.ok, true, revokeOne.res.body)
+    }
+  }
+
   console.log('\n— 4. 修改配置（当前密码验证 + TTL）—')
   const conf = await call('/dsh-webui-oauth/configure', {
     url: '/dsh-webui-oauth/configure', method: 'POST', headers: jsonHeaders(s2),
@@ -192,6 +222,8 @@ try {
   eq('配置保存成功', conf.json && conf.json.ok, true, conf.res.body)
   const st2 = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + s2 } })
   eq('TTL 已更新为 24', st2.json && st2.json.ttl, 24)
+  eq('未改密码时不吊销其他会话', conf.json && conf.json.revoked, 0)
+  eq('passwordChanged=false', conf.json && conf.json.passwordChanged, false)
 
   console.log('\n— 5. 禁用认证 —')
   const badDisable = await call('/dsh-webui-oauth/disable', {
@@ -215,6 +247,29 @@ try {
   eq('重新启用成功', reenable.json && reenable.json.ok, true, reenable.res.body)
   eq('重新启用后下发会话', !!reenable.cookie, true)
   const s3 = reenable.cookie
+
+  console.log('\n— 6b. 改密码：只吊销其他浏览器会话 —')
+  {
+    const extra = await call('/dsh-webui-oauth/login', {
+      url: '/dsh-webui-oauth/login', method: 'POST', headers: jsonHeaders(),
+      body: JSON.stringify({ username: 'admin', password: 'Admin#Passw0rd!' }),
+    })
+    const extraSession = extra.cookie
+    eq('再建一个浏览器会话', !!extraSession, true)
+
+    const chg = await call('/dsh-webui-oauth/configure', {
+      url: '/dsh-webui-oauth/configure', method: 'POST', headers: jsonHeaders(s3),
+      body: JSON.stringify({ username: 'admin', password: 'NewPass#2026!', current: 'Admin#Passw0rd!', ttl: 12 }),
+    })
+    eq('改密码成功', chg.json && chg.json.ok, true, chg.res.body)
+    eq('passwordChanged=true', chg.json && chg.json.passwordChanged, true)
+    eq('至少吊销一个其他会话', chg.json && chg.json.revoked >= 1, true)
+
+    const extraSt = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + extraSession } })
+    eq('其他浏览器会话已失效', extraSt.status, 401, String(extraSt.status))
+    const keepSt = await call('/dsh-webui-oauth/status', { headers: { cookie: 'dsh_wua_session=' + s3 } })
+    eq('当前会话保持有效', keepSt.status, 200, String(keepSt.status))
+  }
 
   console.log('\n— 7. 退出登录 —')
   const out = await call('/dsh-webui-oauth/logout', {

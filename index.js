@@ -649,6 +649,52 @@ function requestMeta(req) {
   return { ip, ua }
 }
 
+/** 从 UA 粗略解析系统 / 浏览器 / 设备形态（用于会话列表展示，不做精确指纹）。 */
+function describeUserAgent(ua) {
+  const s = String(ua || '')
+  let os = '未知系统'
+  if (/Windows NT 10\.0/.test(s)) os = 'Windows 10/11'
+  else if (/Windows NT 6\.3/.test(s)) os = 'Windows 8.1'
+  else if (/Windows/.test(s)) os = 'Windows'
+  else if (/Android/.test(s)) {
+    const m = /Android\s([\d.]+)/.exec(s)
+    os = 'Android' + (m ? ' ' + m[1] : '')
+  } else if (/iPhone|iPad|iPod/.test(s)) {
+    const m = /OS\s([\d_]+)/.exec(s)
+    os = 'iOS' + (m ? ' ' + m[1].replace(/_/g, '.') : '')
+  } else if (/Mac OS X/.test(s)) {
+    const m = /Mac OS X\s([\d_.]+)/.exec(s)
+    os = 'macOS' + (m ? ' ' + m[1].replace(/_/g, '.') : '')
+  } else if (/CrOS/.test(s)) os = 'ChromeOS'
+  else if (/Linux/.test(s)) os = 'Linux'
+
+  let browser = '未知浏览器'
+  if (/Edg\/([\d.]+)/.test(s)) browser = 'Edge ' + /Edg\/([\d.]+)/.exec(s)[1].split('.')[0]
+  else if (/OPR\/([\d.]+)/.test(s)) browser = 'Opera ' + /OPR\/([\d.]+)/.exec(s)[1].split('.')[0]
+  else if (/Chrome\/([\d.]+)/.test(s)) browser = 'Chrome ' + /Chrome\/([\d.]+)/.exec(s)[1].split('.')[0]
+  else if (/Firefox\/([\d.]+)/.test(s)) browser = 'Firefox ' + /Firefox\/([\d.]+)/.exec(s)[1].split('.')[0]
+  else if (/Version\/([\d.]+).*Safari/.test(s)) browser = 'Safari ' + /Version\/([\d.]+)/.exec(s)[1].split('.')[0]
+  else if (/Safari/.test(s)) browser = 'Safari'
+
+  let device = '桌面'
+  if (/iPad|Tablet/.test(s)) device = '平板'
+  else if (/Mobile|iPhone|Android.*Mobile/.test(s)) device = '手机'
+  return { os, browser, device }
+}
+
+/** 会话在列表里的稳定短 id（不暴露原始 token）。 */
+function sessionShortId(token) {
+  return createHash('sha256').update(String(token)).digest('hex').slice(0, 16)
+}
+
+/** 设备指纹：UA + IP 的短哈希（同一浏览器+出口 IP 稳定）。 */
+function sessionFingerprint(sess) {
+  return createHash('sha256')
+    .update(String((sess && sess.ua) || '') + '|' + String((sess && sess.ip) || ''))
+    .digest('hex')
+    .slice(0, 12)
+}
+
 async function readAuditEntries(ctx, limit) {
   let target = null
   try {
@@ -804,7 +850,18 @@ class PersistentSessions {
       try { ev = JSON.parse(line) } catch (e) { continue }
       if (!ev || typeof ev.op !== 'string' || typeof ev.token !== 'string') continue
       if (ev.op === 'add' && ev.sess && typeof ev.sess === 'object') {
-        const s = { username: String(ev.sess.username || ''), expiresAt: Number(ev.sess.expiresAt) || 0, browser: !!ev.sess.browser }
+        const s = {
+          username: String(ev.sess.username || ''),
+          expiresAt: Number(ev.sess.expiresAt) || 0,
+          browser: !!ev.sess.browser,
+          createdAt: Number(ev.sess.createdAt) || 0,
+          lastSeenAt: Number(ev.sess.lastSeenAt) || 0,
+          ip: typeof ev.sess.ip === 'string' ? ev.sess.ip : null,
+          ua: typeof ev.sess.ua === 'string' ? ev.sess.ua : null,
+          os: typeof ev.sess.os === 'string' ? ev.sess.os : '',
+          browserName: typeof ev.sess.browserName === 'string' ? ev.sess.browserName : '',
+          device: typeof ev.sess.device === 'string' ? ev.sess.device : '',
+        }
         if (s.expiresAt > Date.now()) this.live.set(ev.token, s)
       } else if (ev.op === 'remove') {
         this.live.delete(ev.token)
@@ -998,6 +1055,84 @@ class PersistentDevices {
 }
 
 /**
+ * DeepSeek 登录回调中转窗口（独立子窗口，类似 SSO 验证弹窗）。
+ * 用户在主窗口点 DeepSeek 登录时由插件打开；授权后把回环回调 URL 粘进来。
+ */
+function relayWindowPage() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>DeepSeek 登录 · 等待验证</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #f6f7f9; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #15171b; }
+  @media (prefers-color-scheme: dark) { body { background: #141416; color: #f2f3f5; } }
+  .card { width: 400px; max-width: calc(100vw - 40px); padding: 26px 24px; box-sizing: border-box;
+    background: #fff; border: 1px solid rgba(0,0,0,.08); border-radius: 14px; box-shadow: 0 18px 50px rgba(0,0,0,.10); }
+  @media (prefers-color-scheme: dark) { .card { background: #1e1e21; border-color: rgba(255,255,255,.10); box-shadow: 0 18px 50px rgba(0,0,0,.5); } }
+  h1 { margin: 0 0 6px; font-size: 17px; }
+  p.sub { margin: 0 0 14px; font-size: 13px; line-height: 1.65; opacity: .68; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4a7cf7; margin-right: 7px;
+    animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+  input { box-sizing: border-box; width: 100%; height: 38px; padding: 0 11px; font-size: 12.5px; border-radius: 9px;
+    border: 1px solid rgba(0,0,0,.16); background: transparent; color: inherit; outline: none; }
+  input:focus { border-color: #4a7cf7; box-shadow: 0 0 0 3px rgba(74,124,247,.18); }
+  button { width: 100%; height: 40px; margin-top: 12px; font-size: 13px; font-weight: 600; border-radius: 9px; cursor: pointer;
+    border: 1px solid #4a7cf7; background: #4a7cf7; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #m { margin: 12px 0 0; font-size: 12.5px; line-height: 1.6; min-height: 18px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1><span class="dot"></span>等待验证</h1>
+  <p class="sub">请在另一个窗口完成 DeepSeek 授权。授权后浏览器会跳到 <code>127.0.0.1</code> 的回调地址（远程通常打不开），把地址栏里的完整 URL 粘贴到这里。</p>
+  <input id="u" placeholder="http://127.0.0.1:3080/oauth/callback?code=…&state=…" autocomplete="off" spellcheck="false">
+  <button id="b">完成登录</button>
+  <p id="m"></p>
+</div>
+<script>
+(function () {
+  var u = document.getElementById('u');
+  var b = document.getElementById('b');
+  var m = document.getElementById('m');
+  b.addEventListener('click', async function () {
+    var url = u.value.trim();
+    if (!url) { m.textContent = '请粘贴完整回调地址'; return; }
+    b.disabled = true;
+    m.textContent = '正在完成登录…';
+    try {
+      var res = await fetch('/dsh-webui-oauth/oauth-relay', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: url })
+      });
+      if (res.status === 401) { m.textContent = '会话已失效，请关闭本窗口并在主页面重新登录'; return; }
+      var j = await res.json();
+      if (j && j.ok) {
+        m.textContent = '已收到回调，正在完成登录…';
+        try { if (window.opener) window.opener.postMessage({ type: 'dsh-wua-relayed', ok: true }, location.origin); } catch (e) {}
+        setTimeout(function () { try { window.close(); } catch (e) {} }, 700);
+      } else {
+        m.textContent = (j && (j.hint || j.reason || j.error)) || '中转失败';
+      }
+    } catch (e) {
+      m.textContent = '无法连接认证服务';
+    } finally {
+      b.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>`
+}
+
+/**
  * 设备授权批准页（RFC 8628 的 verification_uri）。
  * 公开 GET；真正的批准 POST 需要浏览器会话（自管端点里 checkRequest）。
  * 只回填 A-Z0-9- 的 user_code，避免把 query 原样注入 HTML。
@@ -1053,6 +1188,14 @@ function deviceApprovalPage(userCode) {
   var m = document.getElementById('m');
   var ok = document.getElementById('ok');
   var no = document.getElementById('no');
+  function goLogin() {
+    var next = location.pathname + location.search;
+    location.href = '/dsh-webui-oauth/login?next=' + encodeURIComponent(next);
+  }
+  // 未登录先送去登录页；登录成功（密码或 SSO）后由 next 回到本页并带上 user_code。
+  fetch('/dsh-webui-oauth/status').then(function (r) {
+    if (r.status === 401) goLogin();
+  }).catch(function () {});
   async function act(decision) {
     ok.disabled = true; no.disabled = true;
     m.textContent = '处理中…';
@@ -1061,10 +1204,7 @@ function deviceApprovalPage(userCode) {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ user_code: document.getElementById('c').value, action: decision })
       });
-      if (res.status === 401) {
-        m.innerHTML = '请先登录后再批准。<a href="/dsh-webui-oauth/login">前往登录</a>';
-        return;
-      }
+      if (res.status === 401) { goLogin(); return; }
       var j = await res.json();
       if (j && j.ok) m.textContent = decision === 'approve' ? '已批准，请返回应用完成登录。' : '已拒绝该设备。';
       else m.textContent = (j && (j.reason || j.error)) || '操作失败';
@@ -1199,6 +1339,8 @@ const LOGIN_PAGE = `<!DOCTYPE html>
 var MODE = "__MODE__";
 var OIDC_ENABLED = "__OIDC_ENABLED__";
 var SSO_ONLY = "__SSO_ONLY__";
+var NEXT = '';
+try { NEXT = new URLSearchParams(location.search).get('next') || ''; } catch (err) { NEXT = ''; }
 var sub = document.getElementById('sub'), pl = document.getElementById('pl'), pc = document.getElementById('pc'), e = document.getElementById('e'),
   u = document.getElementById('u'), p = document.getElementById('p'), p2 = document.getElementById('p2'), b = document.getElementById('b'),
   ul = document.getElementById('ul'),
@@ -1237,7 +1379,10 @@ if (SSO_ONLY === 'true' && MODE === 'login') {
 if (sso) {
   sso.addEventListener('click', function () {
     var base = location.origin || '';
-    var target = '/dsh-webui-oauth/oidc/login' + (base ? '?base=' + encodeURIComponent(base) : '');
+    var target = '/dsh-webui-oauth/oidc/login';
+    var sep = '?';
+    if (base) { target += '?base=' + encodeURIComponent(base); sep = '&'; }
+    if (NEXT) target += sep + 'next=' + encodeURIComponent(NEXT);
     location.href = target;
   });
 }
@@ -1269,6 +1414,7 @@ f.addEventListener('submit', function (ev) {
   }
   b.disabled = true; b.textContent = '请稍候…';
   var body = { username: username, password: password };
+  if (NEXT) body.next = NEXT;
   if (MODE === 'setup') body.token = token;
   fetch(MODE === 'setup' ? '/dsh-webui-oauth/setup' : '/dsh-webui-oauth/login', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
@@ -1337,6 +1483,7 @@ const PUBLIC_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oidc/login',   // SSO 发起（未绑定时内部拒绝）
   '/dsh-webui-oauth/oidc/callback',// IdP 回跳（state + PKCE + 验签把关）
   '/dsh-webui-oauth/device',            // 设备授权批准页（GET；批准 POST 走自管端点）
+  '/dsh-webui-oauth/relay-window',     // DeepSeek 登录回调中转子窗口
   '/dsh-webui-oauth/device/authorize',  // RFC 8628 设备授权请求
   '/dsh-webui-oauth/device/token',      // RFC 8628 轮询换 token
 ])
@@ -1362,6 +1509,8 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oauth-relay',
   '/dsh-webui-oauth/remote-trust',
   '/dsh-webui-oauth/sessions/revoke',
+  '/dsh-webui-oauth/sessions/revoke-one',
+  '/dsh-webui-oauth/sessions',
   '/dsh-webui-oauth/device/approve',
   '/dsh-webui-oauth/device/core-session',
   '/dsh-webui-oauth/devices',
@@ -2406,6 +2555,20 @@ const REAUTH_POPUP_HTML = `<!doctype html>
 try { if (window.opener) window.opener.postMessage({ type: 'dsh-wua-reauth', ok: true }, location.origin); } catch (e) {}
 setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
 </script></body></html>`
+
+// OIDC 绑定/换绑的弹窗回调页：通知 opener 后自我关闭。
+const BIND_POPUP_HTML = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>绑定成功</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;background:#0b0b0c;color:#e8e8e8}
+  .box{text-align:center;opacity:.92}
+</style></head>
+<body><div class="box"><p>绑定成功，正在返回设置页…</p><p style="font-size:12px;opacity:.6">如果窗口没有自动关闭，请手动关闭。</p></div>
+<script>
+try { if (window.opener) window.opener.postMessage({ type: 'dsh-wua-bound', ok: true }, location.origin); } catch (e) {}
+setTimeout(function () { try { window.close(); } catch (e) {} }, 400);
+</script></body></html>`
 // 授权请求状态（state / nonce / PKCE verifier）的存活时间。三次握手应在分钟内
 // 完成，10 分钟足够覆盖用户在 IdP 侧慢慢登录的情形，又限制了被滥用的窗口。
 const OIDC_STATE_TTL_MS = 10 * 60 * 1000
@@ -2417,6 +2580,25 @@ const OIDC_MAX_PENDING_STATES = 1000
 // 纯 origin 格式校验：http/https、无 path/query/hash、无 userinfo。
 // 刻意**不做** host 匹配——trustBrowserOrigin 语义即"信前端 origin"，
 // 这里只挡"明显构造的垃圾值/注入"，保底格式合法性。
+/**
+ * 校验登录后回跳路径：只允许同源相对路径。
+ * 拒绝 "//host"、反斜杠、绝对 URL 与协议相对 URL（防开放重定向）。
+ */
+export function safeNextPath(raw) {
+  if (typeof raw !== 'string') return null
+  const value = raw.trim()
+  if (!value || value.length > 2048) return null
+  if (value[0] !== '/' || value[1] === '/') return null
+  if (value.includes('\\')) return null
+  try {
+    const u = new URL(value, 'http://dsh.invalid')
+    if (u.origin !== 'http://dsh.invalid') return null
+    return u.pathname + u.search + u.hash
+  } catch (e) {
+    return null
+  }
+}
+
 export function isValidOrigin(raw) {
   if (typeof raw !== 'string' || !raw.trim()) return false
   // 拒绝控制字符（\r \n \t 等）：WHATWG URL 解析器会静默剥离 CRLF 产生看似合法的畸形 URL，
@@ -2967,7 +3149,13 @@ export async function apply(ctx) {
       sessions.delete(token)
       return false
     }
-    if (s.browser === true) s.expiresAt = Date.now() + SESSION_TTL_MS
+    const now = Date.now()
+    // 最近活跃时间：每分钟最多落盘一次，供会话列表展示。
+    if (now - (s.lastSeenAt || 0) > 60000) {
+      s.lastSeenAt = now
+      sessions.append({ op: 'add', token, sess: s })
+    }
+    if (s.browser === true) s.expiresAt = now + SESSION_TTL_MS
     return true
   }
 
@@ -2998,10 +3186,24 @@ export async function apply(ctx) {
     if (s) delete s.reauthAt
   }
 
-  function createSession(username, ttl) {
+  function createSession(username, ttl, req) {
     const token = randomBytes(24).toString('hex')
     const ttlMs = ttl > 0 ? ttl * 3600 * 1000 : SESSION_TTL_MS
-    sessions.set(token, { username, expiresAt: Date.now() + ttlMs, browser: ttl <= 0 })
+    const meta = requestMeta(req || {})
+    const parsed = describeUserAgent(meta.ua)
+    const now = Date.now()
+    sessions.set(token, {
+      username,
+      expiresAt: now + ttlMs,
+      browser: ttl <= 0,
+      createdAt: now,
+      lastSeenAt: now,
+      ip: meta.ip,
+      ua: meta.ua,
+      os: parsed.os,
+      browserName: parsed.browser,
+      device: parsed.device,
+    })
     return { token, maxAge: ttl > 0 ? ttl * 3600 : undefined }
   }
 
@@ -3212,6 +3414,8 @@ export async function apply(ctx) {
     handler: async (req, res) => {
       try {
         if (req.method === 'GET' || req.method === 'HEAD') {
+          let next = null
+          try { next = safeNextPath(new URL(req.url || '/', 'http://x').searchParams.get('next')) } catch (e) { next = null }
           const credsNow = await readCredentials(ctx)
           // 已有有效会话时，登录页不该再显示表单——直接送回首页。
           //
@@ -3222,8 +3426,10 @@ export async function apply(ctx) {
           // 只在认证已启用时判断：首次初始化（enabledFlag=false）时 checkRequest
           // 恒为 true，不能把首次访问的人也送回首页（那会 404/白屏）。
           if (enabledFlag && checkRequest(req)) {
-            let target = '/'
-            try { target = postLoginRedirect(ctx, req) || '/' } catch (e) { target = '/' }
+            let target = next
+            if (!target) {
+              try { target = postLoginRedirect(ctx, req) || '/' } catch (e) { target = '/' }
+            }
             res.writeHead(302, { location: target, 'cache-control': 'no-store' })
             res.end()
             return
@@ -3231,7 +3437,9 @@ export async function apply(ctx) {
           // 「仅允许 SSO」：密码表单没有意义，直接送去 SSO 入口。
           // 放在会话判断之后：已登录仍然优先回首页。
           if (enabledFlag && ssoOnlyActiveFlag) {
-            res.writeHead(302, { location: loginLocation(req), 'cache-control': 'no-store' })
+            let location = loginLocation(req)
+            if (next) location += (location.includes('?') ? '&' : '?') + 'next=' + encodeURIComponent(next)
+            res.writeHead(302, { location, 'cache-control': 'no-store' })
             res.end()
             return
           }
@@ -3304,10 +3512,11 @@ export async function apply(ctx) {
             sendJson(res, 200, { ok: false, error: 'invalid' })
             return
           }
-          const s = createSession(username, ttlOf(creds))
+          const s = createSession(username, ttlOf(creds), req)
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
           await auditLog(ctx, 'login_success', { username, ip: meta.ip, ua: meta.ua })
-          sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
+          const next = safeNextPath(body.next)
+          sendJson(res, 200, { ok: true, redirect: next || postLoginRedirect(ctx, req) })
           return
         }
         sendJson(res, 405, { error: '仅支持 GET/POST' })
@@ -3365,7 +3574,7 @@ export async function apply(ctx) {
         await writeCredentials(ctx, { v: 3, username, hash: await hashPassword(password), ttl: TTL_DEFAULT })
         try { unlinkSync(DATA_DIR + '/setup-token') } catch (e) { /* already gone */ }
         enabledFlag = true
-        const s = createSession(username, TTL_DEFAULT)
+        const s = createSession(username, TTL_DEFAULT, req)
         res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         await auditLog(ctx, 'setup_success', { username, ip: meta.ip, ua: meta.ua })
         sendJson(res, 200, { ok: true, redirect: postLoginRedirect(ctx, req) })
@@ -3443,6 +3652,105 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-oauth: revoke sessions')
+
+  // 浏览器会话列表：GET /dsh-webui-oauth/sessions
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/sessions',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        if (enabledFlag && !sessionOf(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const currentToken = cookieOf(req, COOKIE_NAME)
+        const now = Date.now()
+        const out = []
+        for (const [token, s] of sessions.live) {
+          if (s.expiresAt <= now) continue
+          out.push({
+            id: sessionShortId(token),
+            current: token === currentToken,
+            createdAt: s.createdAt || null,
+            lastSeenAt: s.lastSeenAt || s.createdAt || null,
+            expiresAt: s.expiresAt,
+            os: s.os || '',
+            browser: s.browserName || '',
+            device: s.device || '',
+            ip: s.ip || null,
+            fingerprint: sessionFingerprint(s),
+          })
+        }
+        out.sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
+        sendJson(res, 200, { ok: true, sessions: out })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: sessions list')
+
+  // 吊销指定浏览器会话：POST /dsh-webui-oauth/sessions/revoke-one
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/sessions/revoke-one',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (enabledFlag && !sessionOf(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const id = String(body.id || '')
+        const currentToken = cookieOf(req, COOKIE_NAME)
+        let target = null
+        for (const token of sessions.live.keys()) {
+          if (sessionShortId(token) === id) { target = token; break }
+        }
+        if (!target) {
+          sendJson(res, 200, { ok: false, error: 'not-found' })
+          return
+        }
+        if (target === currentToken) {
+          sendJson(res, 200, { ok: false, error: 'current-session', reason: '当前会话请用「退出登录」' })
+          return
+        }
+        sessions.delete(target)
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'session_revoked', { username: null, ip: meta.ip, ua: meta.ua, detail: id })
+        sendJson(res, 200, { ok: true })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: revoke one session')
+
+  // DeepSeek 登录回调中转子窗口
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/relay-window',
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        sendJson(res, 405, { error: '仅支持 GET' })
+        return
+      }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+      })
+      res.end(relayWindowPage())
+    },
+  }), 'dsh-webui-oauth: relay window')
 
   // ---------------- 设备授权（RFC 8628 device_code） ----------------
   //
@@ -4066,11 +4374,21 @@ export async function apply(ctx) {
         // 不必等后台定时器（否则用户保存后要最多 60 秒才看到效果）。
         await refreshSsoOnly(credsOut)
         enabledFlag = true
+        let revoked = 0
         if (wasEnabled) {
-          const keepToken = cookieOf(req, COOKIE_NAME)
-          destroyAllSessionsExcept(keepToken)
+          // 只有**改密码**才需要吊销其它浏览器会话；只改 TTL/OIDC 配置不应该
+          // 把人从别的浏览器里踢出去。设备会话始终不受影响（它们由设备列表单独吊销）。
+          if (!keepPassword) {
+            const keepToken = cookieOf(req, COOKIE_NAME)
+            let before = 0
+            for (const _ of sessions.live) before += 1
+            destroyAllSessionsExcept(keepToken)
+            let after = 0
+            for (const _ of sessions.live) after += 1
+            revoked = Math.max(0, before - after)
+          }
         } else {
-          const s = createSession(username, ttl)
+          const s = createSession(username, ttl, req)
           res.setHeader('Set-Cookie', sessionCookie(s.token, s.maxAge))
         }
         const detailParts = []
@@ -4078,7 +4396,7 @@ export async function apply(ctx) {
         if (body.ttl !== undefined) detailParts.push('有效期已修改')
         await auditLog(ctx, 'configure_success', { username, ip: meta.ip, ua: meta.ua, detail: detailParts.length ? detailParts.join('，') : null })
         clearSessionReauth(req)
-        sendJson(res, 200, { ok: true })
+        sendJson(res, 200, { ok: true, revoked, passwordChanged: !keepPassword })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
@@ -4200,9 +4518,11 @@ export async function apply(ctx) {
     // 的小页面，而不是把整个应用加载进弹窗。
     let popup = false
     try {
-      popup = purpose === 'reauth' && new URL(req.url || '/', 'http://x').searchParams.get('popup') === '1'
+      popup = new URL(req.url || '/', 'http://x').searchParams.get('popup') === '1'
     } catch (e) { popup = false }
-    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose, sessionToken, popup })
+    let next = null
+    try { next = safeNextPath(new URL(req.url || '/', 'http://x').searchParams.get('next')) } catch (e) { next = null }
+    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose, sessionToken, popup, next })
     const authUrl = new URL(disc.metadata.authorization_endpoint)
     authUrl.searchParams.set('response_type', 'code')
     authUrl.searchParams.set('client_id', o.clientId)
@@ -4527,7 +4847,17 @@ export async function apply(ctx) {
           // 保留原有 username/hash/ttl，只加 boundSub —— 用 spread 以免漏字段。
           await writeCredentials(ctx, { ...creds, boundSub: rawSub })
           await auditLog(ctx, 'oidc_bind_success', { username: auditName, ip: meta.ip, ua: meta.ua })
-          // 成功必须【把浏览器送回应用】，而不是停在 JSON 上（见 redirectBackToApp 说明）。
+          // 弹窗发起：回一个自我关闭的页面；否则把浏览器送回应用。
+          if (st.popup) {
+            res.writeHead(200, {
+              'content-type': 'text/html; charset=utf-8',
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+              'set-cookie': clearStateCookie['Set-Cookie'],
+            })
+            res.end(BIND_POPUP_HTML)
+            return
+          }
           redirectBackToApp(ctx, req, res, 'oidcbound=1', clearStateCookie)
           return
         }
@@ -4549,7 +4879,7 @@ export async function apply(ctx) {
 
         // 建本地会话。身份用**原始 sub**（sanitize 是有损的：'a/b' 与 'a_b' 会塌成同一个
         // 本地用户名，拿它当身份会张冠李戴）；审计里才用 sanitizeSub 过滤后的短标识。
-        const s = createSession(rawSub, ttlOf(creds))
+        const s = createSession(rawSub, ttlOf(creds), req)
         await auditLog(ctx, 'oidc_login_success', { username: auditName, ip: meta.ip, ua: meta.ua })
         // 授权往返结束：直接 302 回应用，并同时下发会话 Cookie、清除一次性 state Cookie。
         //
@@ -4558,7 +4888,8 @@ export async function apply(ctx) {
         // 被 302 到 IdP 再 302 回来的），渲染 JSON 就停在死页面上了。
         // Set-Cookie 必须一次带两条（会话 + 清除 state），缺任一条都会出问题。
         res.writeHead(302, {
-          location: postLoginRedirect(ctx, req),
+          // 有 next（例如设备批准页）就回原页面；否则回应用根并带核心 launch token。
+          location: st.next || postLoginRedirect(ctx, req),
           'Set-Cookie': [sessionCookie(s.token, s.maxAge), clearStateCookie['Set-Cookie']],
         })
         res.end()
