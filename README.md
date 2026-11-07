@@ -411,6 +411,8 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
 ## 已知边界
 
+- **DSH Desktop**：支持 `dsh-desktop-*` 标记透传（登录 / 退出后重登不再丢失标记），但**不提供**上游 0.3.6 的「宿主载体桥」。该桥只用 socket 是否回环来判定，而本部署是 nginx 同机反代——所有请求的 socket 都是 `127.0.0.1`，启用它等于"持有核心 Cookie 即可绕过插件会话 / SSO"，与「仅允许 SSO」冲突。若必须使用 DSH Desktop 的 shell 直连模式，请改用上游原版插件，并自行评估该旁路风险。
+- **审计日志字段类型**：0.7.2 起 `null` 与 boolean 原样写入（不再变成字符串 `"null"` / `"true"`）；旧日志解析代码若假设"所有字段都是字符串"，需相应调整。
 - **dsh 0.2.2-rc.1 的 fallback 形状**：该版本起 `webServer.fallback` 可能是 `{ resource }`（`dsh-host-frontend-static` 就是这样注册的），而不再是函数。插件已兼容函数 / `{ resource }` / `{ handler }` 三种形状；资源型 fallback 同样会被闸门包装。若升级后 `/` 返回 `500` 且 body 为空（nginx 日志 `500 0`），请确认插件版本 ≥ 0.7.1。
 - **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。
 - **WS 与 trustedHosts**：反代/局域网（非回环 Host）下，WS 下行需在 dsh 配置 `client-connection.trustedHosts` 中加入对外域名（见「架构」节）。

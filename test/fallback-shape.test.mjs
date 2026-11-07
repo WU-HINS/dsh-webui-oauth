@@ -11,7 +11,7 @@
  *
  * 运行：node test/fallback-shape.test.mjs   （或 npm test）
  */
-import { serveFallback, installRouteGate } from '../index.js'
+import { serveFallback, installRouteGate, fallbackShape } from '../index.js'
 
 let pass = 0
 let fail = 0
@@ -71,6 +71,18 @@ console.log('— 1. fallback 形状分派 —')
   eq('未知形状返回 false，不抛异常', await serveFallback({ webServer: { fallback: { nope: 1 } } }, req('/'), res()), false)
   // ⑥ { resource } 但核心没有 serveResource
   eq('缺 serveResource 时返回 false，不抛 TypeError', await serveFallback({ webServer: { fallback: { resource: async () => new Response('x') } } }, req('/'), res()), false)
+}
+
+// ---------------- 1b. 形状判定（供 status / 启动自检 / 一次性诊断） ----------------
+console.log('\n— 1b. fallbackShape —')
+{
+  eq('未注册 → absent', fallbackShape({}), 'absent')
+  eq('undefined webServer → absent', fallbackShape(undefined), 'absent')
+  eq('函数 → handler', fallbackShape({ fallback: async () => {} }), 'handler')
+  eq('resource + serveResource → resource', fallbackShape({ fallback: { resource: async () => {} }, serveResource: async () => {} }), 'resource')
+  eq('resource 但缺 serveResource → unknown', fallbackShape({ fallback: { resource: async () => {} } }), 'unknown')
+  eq('认不出的对象 → unknown', fallbackShape({ fallback: { nope: 1 } }), 'unknown')
+  eq('null → unknown', fallbackShape({ fallback: null }), 'unknown')
 }
 
 // ---------------- 2. 闸门必须覆盖 resource fallback ----------------

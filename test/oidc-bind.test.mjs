@@ -358,6 +358,50 @@ console.log('\n— 1e. 已有有效会话访问登录页 → 直接回首页 —
     String(withoutSession.res.body).slice(0, 40))
 }
 
+console.log('\n— 1f. DSH Desktop 标记透传不得影响门禁 —')
+{
+  // 适配层只做两件事：未认证时记住标记（写 Cookie），已认证后把标记补回 URL。
+  // 关键约束：remember 在认证判定之前调用，但**不参与放行**；restore 只在
+  // checkRequest 通过之后调用。下面逐条锁死。
+  const DESKTOP_URL = '/?dsh-desktop-mode=advanced&dsh-desktop-platform=win32'
+
+  // ① 未登录：带桌面标记也必须先去登录页，只允许写暂存 Cookie
+  const anon = await call('', { url: DESKTOP_URL })
+  eq('未登录带桌面标记仍 302', anon.status === 302, String(anon.status))
+  eq('未登录去登录页（不是补投地址）',
+    String(anon.location || '') === '/dsh-webui-oauth/login', String(anon.location))
+  const setCookie = String((anon.res.headers && anon.res.headers['Set-Cookie']) || '')
+  eq('未登录只写暂存 Cookie，不放行', setCookie.includes('dsh_wua_desktop='), setCookie.slice(0, 80))
+
+  const stash = setCookie.split(';')[0]
+  eq('暂存 Cookie 形如 name=value', /^dsh_wua_desktop=/.test(stash), stash.slice(0, 60))
+
+  // ② 已登录 + 干净 "/"：补投回带标记的 URL
+  const session = await loginLocal()
+  const authed = await call('', {
+    url: '/',
+    headers: { cookie: 'dsh_wua_session=' + session + '; ' + stash },
+  })
+  eq('已登录被补投回带标记 URL', authed.status === 302, String(authed.status))
+  eq('补投目标保留全部标记', String(authed.location || '') === DESKTOP_URL, String(authed.location))
+
+  // ③ 核心 token 交换优先：restore 不得抢跳
+  const tok = await call('', {
+    url: '/?token=abc',
+    headers: { cookie: 'dsh_wua_session=' + session + '; ' + stash },
+  })
+  eq('token 交换未被补投抢走',
+    String(tok.location || '') !== DESKTOP_URL, String(tok.location))
+  eq('token 交换走到核心兜底（本桩无 fallback → 404）', tok.status === 404, String(tok.status))
+
+  // ④ 无暂存 Cookie 的已登录用户：行为与未接入前一致
+  const plain = await call('', {
+    url: '/',
+    headers: { cookie: 'dsh_wua_session=' + session },
+  })
+  eq('无暂存时不被补投', String(plain.location || '') !== DESKTOP_URL, String(plain.location))
+}
+
 console.log('\n— 2. 绑定端点存在且要求已登录 —')
 {
   eq('注册了 /oidc/bind', routes.has('/dsh-webui-oauth/oidc/bind'))

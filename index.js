@@ -157,6 +157,9 @@ import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unl
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
+// 宿主适配层（DSH Desktop 的 dsh-desktop-* 标记透传）。
+// 整体摘除：删掉本行 + 网关里两处标着「宿主适配层」的代码块 + lib/desktop-adapter.js。
+import { desktopAdapter } from './lib/desktop-adapter.js';
 
 export const name = 'dsh-webui-oauth'
 
@@ -580,7 +583,11 @@ async function auditLog(ctx, event, fields) {
       let v = fields[key]
       if (v === undefined) continue
       if (key === 'ip' && typeof v === 'string') v = anonymizeIp(v)
-      entry[key] = typeof v === 'string' || typeof v === 'number' ? v : String(v)
+      // null / boolean 原样保留：早先一律 String()，日志里会出现字符串 "null"、
+      // "true"，读起来像出了故障（upstream 0.3.6 的同类修复）。
+      entry[key] = (v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+        ? v
+        : String(v)
     }
     appendFileSync(target, JSON.stringify(entry) + '\n', 'utf8')
   } catch (e) {
@@ -1187,6 +1194,62 @@ export async function serveFallback(ctx, req, res) {
     return true
   }
   return false
+}
+
+/**
+ * 判断核心兜底席位的形状。
+ * 核心升级可能再次改变它（函数 → { resource } → ？），把形状单独抽出来，
+ * 既供 status 回显，也供启动自检与一次性诊断使用。
+ *
+ * @returns {'absent'|'handler'|'resource'|'unknown'}
+ */
+export function fallbackShape(webServer) {
+  if (!webServer) return 'absent'
+  const fallback = webServer.fallback
+  if (fallback === undefined) return 'absent'
+  if (typeof fallback === 'function') return 'handler'
+  if (fallback !== null && typeof fallback === 'object' &&
+      'resource' in fallback && typeof webServer.serveResource === 'function') return 'resource'
+  return 'unknown'
+}
+
+// 形状不兼容只报一次：每个文档请求都刷一条 error 会把日志淹掉。
+let fallbackProblemReported = false
+
+/**
+ * 形态不认识时的一次性诊断：说清期望什么、实际是什么，别让 500/空 404 掩盖过去。
+ * 仅写日志，不改变响应（响应由 sendFallbackUnavailable 负责）。
+ */
+export function reportFallbackProblem(ctx) {
+  if (fallbackProblemReported) return
+  fallbackProblemReported = true
+  try {
+    const ws = ctx && ctx.webServer
+    const fallback = ws ? ws.fallback : undefined
+    const actual = fallback === undefined
+      ? 'undefined'
+      : typeof fallback === 'function'
+        ? 'function'
+        : (fallback !== null && typeof fallback === 'object')
+          ? 'object { ' + Object.keys(fallback).join(', ') + ' }'
+          : typeof fallback
+    const canServe = !!(ws && typeof ws.serveResource === 'function')
+    ctx.logger.error('[dsh-webui-oauth] INCOMPATIBLE CORE: cannot hand the document back to'
+      + ' webServer.fallback — expected a handler function, or { resource } together with'
+      + ' webServer.serveResource(); got ' + actual
+      + ' (serveResource: ' + (canServe ? 'present' : 'missing') + ').'
+      + ' webServer.fallback shape may have changed again; authenticated pages answer 404 until the plugin is updated.')
+  } catch (e) { /* logging must never throw */ }
+}
+
+/** 形态不认识时给操作者一句能看懂的话，而不是空白页/500。 */
+export function sendFallbackUnavailable(res) {
+  res.writeHead(404, {
+    'content-type': 'text/plain; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+  })
+  res.end('dsh-webui-oauth: core webServer.fallback is unavailable or incompatible\n')
 }
 
 function rejectUpgrade401(socket) {
@@ -2504,6 +2567,18 @@ export async function apply(ctx) {
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
   }
 
+  // 核心兜底席位形状自检：认得出就报一句，认不出就明确报「不兼容当前核心版本」，
+  // 不要等到用户登录换 cookie 时才以 500/空页暴露。'absent' 可能只是
+  // frontend-static 尚未注册，留到首个文档请求时再诊断。
+  {
+    const shape = fallbackShape(ctx.webServer)
+    if (shape === 'handler' || shape === 'resource') {
+      ctx.logger.info('[dsh-webui-oauth] core fallback seat: ' + shape)
+    } else if (shape === 'unknown') {
+      ctx.logger.error('[dsh-webui-oauth] INCOMPATIBLE CORE: webServer.fallback is neither a handler function nor { resource } + webServer.serveResource(); authenticated pages will answer 404')
+    }
+  }
+
   ctx.logger.info('[dsh-webui-oauth] started, credentials file: ' + configPath())
   if (!enabledFlag) {
     // H1: token 同时落盘（0600，仅本机操作者可读），setup 成功后删除。
@@ -2792,6 +2867,9 @@ export async function apply(ctx) {
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
+          // 核心兜底席位形态（handler | resource | absent | unknown）：核心升级后
+          // 如果这里变成 unknown，文档请求会 404 —— 排查时先看这个字段。
+          fallback: fallbackShape(ctx.webServer),
           gate: {
             ok: gate.ok(),
             problems: gate.problems().slice(0, 3),
@@ -3492,7 +3570,20 @@ export async function apply(ctx) {
     path: '',
     handler: async (req, res) => {
       try {
+        // ─────── 宿主适配层（DSH Desktop）· 整体摘除时删掉本块 ───────
+        // 必须在认证判定之前：退出登录是客户端自己 location.href = '/'，
+        // 服务端看不到带标记的 URL 被放弃，只能在加载时提前记住。
+        // 注意：remember() 只写 Cookie，不参与放行；门禁仍由 checkRequest 决定。
+        desktopAdapter.remember(req, res)
+        // ──────────────────────────────────────────────────────────
         if (checkRequest(req)) {
+          // ─────── 宿主适配层（DSH Desktop）· 整体摘除时删掉本块 ───────
+          // 核心 token→cookie 交换会把浏览器 303 到干净的 "/"，桌面端
+          // advanced / extended 模式依赖 URL 上的 dsh-desktop-* 标记才会接管
+          // layout 服务，这里把记住的标记补回 URL 再放行。
+          // 只在 checkRequest 通过之后调用：未认证请求绝不会走到这里。
+          if (desktopAdapter.restore(req, res)) return
+          // ──────────────────────────────────────────────────────────
           // alpha.2+：插件会话通过后，核心 BrowserAuth 可能仍未认领该浏览器
           // （核心 cookie 缺失/过期）。主动引导去带 launch token 的根 URL 完成
           // 核心 token→cookie 交换，否则 fallback 的 authorizeIndex 会 401 死锁。
@@ -3510,8 +3601,10 @@ export async function apply(ctx) {
           // fallback 可能是函数，也可能是 { resource }（0.2.2-rc.1+）。
           // 交给 serveFallback 统一分派，避免 TypeError → 500 空响应。
           if (await serveFallback(ctx, req, res)) return
-          res.writeHead(404)
-          res.end()
+          // 形态不认识 / 核心还没注册：明确报一次，并回带说明的 404，
+          // 不要留一个空 body 让运维去猜。
+          reportFallbackProblem(ctx)
+          sendFallbackUnavailable(res)
           return
         }
         res.writeHead(302, { location: loginLocation(req) })

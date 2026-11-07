@@ -2,6 +2,50 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.7.2
+
+合并上游（Yuuz12/dsh-webui-auth）0.3.5–0.3.7 中**可安全合并**的部分；
+宿主载体桥 / 桌面端锁因会绕过现有门禁，未合并。
+
+### 合并：DSH Desktop 标记透传（upstream 0.3.5 / #8）
+
+- 新增 `lib/desktop-adapter.js`（自包含、可整体摘除）；
+- 渲染器加载时把 `dsh-desktop-*` 标记写入 HttpOnly Cookie（`dsh_wua_desktop`，12h）；
+- 之后落到干净 `/` 时 302 回带标记的 URL，修复桌面端 advanced/extended 模式下
+  12 个 layout 依赖插件停在 pending 的问题。
+- **不影响门禁**：`remember()` 在认证判定之前调用但只写 Cookie；`restore()` 只在
+  `checkRequest()` 通过之后调用。未登录请求带标记仍然去登录页。
+- 已加 9 项集成断言（oidc-bind 1f）+ 24 项纯函数断言。
+
+### 合并：审计日志 null/boolean 不再被字符串化（upstream 0.3.6）
+
+`auditLog` 原先把非 string/number 一律 `String()`，导致日志里出现字符串
+`"null"` / `"true"`。现在 null 与 boolean 原样保留。
+
+### 合并：fallback 诊断增强（upstream 0.3.7）
+
+我们在 0.7.1 已独立修复 `{ resource }` 兼容；本次补上可观测性：
+
+- `status` 新增 `fallback: 'handler' | 'resource' | 'absent' | 'unknown'`；
+- 启动日志输出 `core fallback seat: handler/resource`，unknown 时 error；
+- 形态不认识时输出**一次性**诊断，并返回带说明的 404（不再是空 body）。
+
+### 未合并（有意）
+
+- **宿主载体桥（0.3.6 C6）**：其 `isLoopbackPeer()` 只看 socket 地址。
+  本部署是 nginx 同机反代，所有请求的 socket 都是 127.0.0.1，等于"持有核心
+  Cookie 即可绕过插件会话/SSO"，与「仅允许 SSO」直接冲突。
+- **桌面端锁（0.3.6 C8）**：UI 级锁，对 Web 部署无价值。
+- **exact 路由覆盖（0.3.6 C7）**：我们的 deny-by-default 已覆盖全部 exact
+  （实测 `/plugins/events` 匿名 401），无需合并。
+
+### 测试
+
+- 新增 `test/desktop-marker.test.mjs`（24 项）、`test/audit-null.test.mjs`（7 项）；
+  `test/fallback-shape.test.mjs` 增加 7 项形状判定；`test/oidc-bind.test.mjs`
+  增加 9 项"桌面标记不影响门禁"集成断言。
+- 全量 20 个测试文件、535 项断言通过。
+
 ## 0.7.1
 
 兼容 dsh **0.2.2-rc.1**：`webServer.fallback` 从函数改成了 `{ resource }`。

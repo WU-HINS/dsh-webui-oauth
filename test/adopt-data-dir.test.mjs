@@ -25,6 +25,18 @@ const eq = (n, c, x) => { if (c) { pass++; console.log('  ok   ' + n) } else { f
 const here = dirname(fileURLToPath(import.meta.url))
 const modulePath = join(here, '..', 'index.js')
 
+/**
+ * 把插件源码复制到临时插件目录。
+ * index.js 现在 import 了 ./lib/desktop-adapter.js，只复制 index.js 会
+ * ERR_MODULE_NOT_FOUND —— 这里连同它的依赖一起复制。
+ */
+function copyPlugin(destDir) {
+  mkdirSync(destDir, { recursive: true })
+  copyFileSync(modulePath, join(destDir, 'index.js'))
+  mkdirSync(join(destDir, 'lib'), { recursive: true })
+  copyFileSync(join(here, '..', 'lib', 'desktop-adapter.js'), join(destDir, 'lib', 'desktop-adapter.js'))
+}
+
 const roots = []
 const freshRoot = () => { const d = mkdtempSync(join(tmpdir(), 'adopt-')); roots.push(d); return d }
 
@@ -36,8 +48,7 @@ const freshRoot = () => { const d = mkdtempSync(join(tmpdir(), 'adopt-')); roots
 function probeDataDir({ pluginDirName, hostDir, dshHome, selfHasCred, siblings }) {
   // 构造宿主的插件目录
   const selfDir = join(hostDir, pluginDirName)
-  mkdirSync(selfDir, { recursive: true })
-  copyFileSync(modulePath, join(selfDir, 'index.js'))
+  copyPlugin(selfDir)
   if (selfHasCred) writeFileSync(join(selfDir, 'dsh-webui-auth.json'), JSON.stringify({ v: 3, username: 'self' }))
   for (const [name, cred] of Object.entries(siblings || {})) {
     const d = join(hostDir, name)
@@ -141,8 +152,7 @@ console.log('\n— 6. 显式 DSH_WEBUI_AUTH_DATA_DIR 覆盖优先于接管 —')
   const dshHome = join(host, 'dshhome')
   const forced = join(host, 'forced-data')
   const selfDir = join(host, 'dsh-webui-oauth')
-  mkdirSync(selfDir, { recursive: true })
-  copyFileSync(modulePath, join(selfDir, 'index.js'))
+  copyPlugin(selfDir)
   mkdirSync(join(host, 'dsh-webui-auth'), { recursive: true })
   writeFileSync(join(host, 'dsh-webui-auth', 'dsh-webui-auth.json'), JSON.stringify(cred('orig')))
   mkdirSync(forced, { recursive: true })

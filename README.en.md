@@ -401,6 +401,14 @@ wired into `npm test`).
 
 ## Known limits
 
+- **DSH Desktop**: `dsh-desktop-*` marker pass-through is supported (markers survive login and
+  re-login), but upstream 0.3.6's **host carrier bridge is intentionally not included**. That bridge
+  decides "loopback" purely from the socket address, and this deployment sits behind an nginx proxy on
+  the same host — every request's socket is `127.0.0.1`, so enabling it would mean "a core cookie is
+  enough to bypass the plugin session / SSO", which conflicts with the SSO-only policy. If you must use
+  DSH Desktop's shell-direct mode, use the upstream plugin and evaluate that bypass yourself.
+- **Audit field types**: since 0.7.2 `null` and booleans are written as-is (no longer stringified to
+  `"null"` / `"true"`); any log consumer that assumed every field is a string must be adjusted.
 - **Fallback shape on dsh 0.2.2-rc.1**: since that version `webServer.fallback` may be `{ resource }` (that is how `dsh-host-frontend-static` registers it) instead of a function. The plugin now handles function / `{ resource }` / `{ handler }`; a resource fallback is gated as well. If `/` returns an empty `500` after upgrading (nginx logs `500 0`), make sure the plugin is ≥ 0.7.1.
 - **Inherent runtime-wrapping window**: between a route-object replacement (service hot-reload) and the next rescan (≤10s) there is an unprotected window; the fail-closed check on enabling covers the "initially exposed" case, so this window only affects hot-reload during runtime.
 - **WebSocket and `trustedHosts`**: in reverse-proxy / LAN deployments (non-loopback Host), WS downlinks need the public hostname added to `client-connection.trustedHosts` in the DSH config (see "Architecture").
