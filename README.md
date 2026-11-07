@@ -90,7 +90,7 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 > **0.6.7 起为「默认拒绝」白名单模型。** 此前只包 `/api` 与 `/plugins`，而 webServer 按「exact 优先、其次最长前缀」匹配——第三方插件注册的 `/dsh-any-background/font`、`/dsh-550c-boot/update` 等更具体的路由会抢在本插件的 `""` 前缀之前命中，完全绕过鉴权（实测未登录即 200 读出用户字体、壁纸与镜像指纹，而写端点因走 RPC 通道反而 401）。黑名单追不上新装的插件，白名单不会漏。
 >
-> **能匿名访问的完整清单**：`/dsh-webui-oauth/login`、`/setup`、`/oidc/login`、`/oidc/callback`、`/oauth/callback`。部署方可用 `remote-web-ui.publicPaths` 追加（见下）。
+> **能匿名访问的完整清单**：`/dsh-webui-oauth/login`、`/setup`、`/oidc/login`、`/oidc/callback`。`/oauth/callback`（官方 DeepSeek 账号登录的回调）**不在白名单**——它受会话闸门保护；远程部署由插件的「回调中转」端点代为完成（见「DeepSeek 官方账号登录」）。部署方可用 `remote-web-ui.publicPaths` 追加（见下）。
 >
 > **会话失效时的行为**：浏览器直接导航（`Accept: text/html`）→ 302 回登录页；`fetch`/XHR 接口 → 401，由客户端插件拦截后跳登录页。已有有效会话再访问登录页 → 直接 302 回首页（带核心 launch token，顺带完成核心 Cookie 交换）。
 
@@ -419,10 +419,12 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
 ## 已知边界
 
-- **DeepSeek 官方账号登录（0.2.1+）**：本插件已把 `/oauth/callback` 放进公开白名单（包括登录开始时才**动态注册**的那一次），匿名回调不会被闸门拦截。但上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` **只接受** `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），明确不支持反代域名。因此：
-  - 本机 `http://127.0.0.1:3080` 访问：官方登录可正常走完；
-  - 经域名访问：点登录会以 `protocol` 错失败（这是上游设计限制，与插件无关）。可先用 `http://127.0.0.1:3080` 或 SSH 本地转发完成一次登录——账号 token 保存在 Host 凭证里，之后经域名访问仍然有效；
-  - 若要在域名下直接登录，需要上游放开该限制（或自行 fork 账号平台）。本插件不会 monkey-patch 核心内部函数，以避免升级即碎。
+- **DeepSeek 官方账号登录（0.2.1+，远程回调中转）**：`/oauth/callback` **不是公开路径**，仍受会话闸门保护。上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` 只接受 `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），不支持反代域名。插件的处理方式：
+  - 劫持官方登录的 `callbackOrigin`：本地回环访问保留原 origin（cookie 同 host，回调直接命中）；域名访问改写成 `http://127.0.0.1:<本机端口>`；
+  - 浏览器授权后会被跳到这个回环回调地址——远程机器上通常打不开，但地址栏里有完整 URL；
+  - 设置 → 身份认证 → 远程访问 →「打开回调中转窗口」，把地址栏 URL 粘贴进去；插件在服务端**内部重放**给账号平台注册的 `/oauth/callback` handler（state + PKCE 仍由平台校验），完成换 token；
+  - 中转端点要求插件会话，且只接受本机端口的 `/oauth/callback` + 单个 `code`/`state`（防 SSRF / 开放重定向）；
+  - 本机 `http://127.0.0.1:3080` 访问时官方登录原本就能直接走完，无需中转。
 - **DSH Desktop**：支持 `dsh-desktop-*` 标记透传（登录 / 退出后重登不再丢失标记），但**不提供**上游 0.3.6 的「宿主载体桥」。该桥只用 socket 是否回环来判定，而本部署是 nginx 同机反代——所有请求的 socket 都是 `127.0.0.1`，启用它等于"持有核心 Cookie 即可绕过插件会话 / SSO"，与「仅允许 SSO」冲突。若必须使用 DSH Desktop 的 shell 直连模式，请改用上游原版插件，并自行评估该旁路风险。
 - **审计日志字段类型**：0.7.2 起 `null` 与 boolean 原样写入（不再变成字符串 `"null"` / `"true"`）；旧日志解析代码若假设"所有字段都是字符串"，需相应调整。
 - **dsh 0.2.2-rc.1 的 fallback 形状**：该版本起 `webServer.fallback` 可能是 `{ resource }`（`dsh-host-frontend-static` 就是这样注册的），而不再是函数。插件已兼容函数 / `{ resource }` / `{ handler }` 三种形状；资源型 fallback 同样会被闸门包装。若升级后 `/` 返回 `500` 且 body 为空（nginx 日志 `500 0`），请确认插件版本 ≥ 0.7.1。

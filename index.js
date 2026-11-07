@@ -157,6 +157,7 @@ import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unl
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
 import { promisify } from "node:util";
+import { AsyncLocalStorage } from "node:async_hooks";
 // 宿主适配层（DSH Desktop 的 dsh-desktop-* 标记透传）。
 // 整体摘除：删掉本行 + 网关里两处标着「宿主适配层」的代码块 + lib/desktop-adapter.js。
 import { desktopAdapter } from './lib/desktop-adapter.js';
@@ -1051,6 +1052,11 @@ f.addEventListener('submit', function (ev) {
 
 const API_PREFIX = '/api'
 const PLUGINS_PREFIX = '/plugins'
+
+// 每次 /api 请求的上下文：官方 DeepSeek 登录需要知道"浏览器用的是哪个回环 origin"，
+// 以便把回调 origin 选成同一 host（cookie 才能对上）。用 AsyncLocalStorage 而不是
+// 全局变量，避免并发请求互相串。
+const apiRequestStore = new AsyncLocalStorage()
 // alpha.2 起事件流 WebSocket 由 dsh-api-gateway 的 /api/remote.mux 承载；
 // 旧的 events.mux/events.host 已删除。候选列表仅用于"核心事件流是否就位"的
 // fail-closed 判断；实际包装已改为**所有** upgrade 路由（见 installRouteGate）。
@@ -1070,12 +1076,15 @@ const UPGRADE_CANDIDATES = ['/api/remote.mux', '/api/events.mux', '/api/events.h
 // 公开（允许匿名）的**精确路径**。只放行登录/OIDC 往返所必需的最小集合：
 // 少一条登录就进不去，多一条就可能泄露数据。新增请写进 remote-web-ui.publicPaths，
 // 不要直接改这里——部署差异不该进代码。
+//
+// 注意：**不包含** /oauth/callback（官方 DeepSeek 账号登录的回调）。它由账号平台
+// 在登录开始时动态注册，必须持有插件会话才能访问；远程部署下浏览器根本到不了
+// 这个回环地址，改由本插件的「回调中转」端点代为完成（见 oauthRelay）。
 const PUBLIC_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/login',        // 登录页 GET + 提交 POST
   '/dsh-webui-oauth/setup',        // 首次初始化（由 setup token 把关）
   '/dsh-webui-oauth/oidc/login',   // SSO 发起（未绑定时内部拒绝）
   '/dsh-webui-oauth/oidc/callback',// IdP 回跳（state + PKCE + 验签把关）
-  '/oauth/callback',               // 账号平台的 OAuth 回跳（state 常量时间比对）
 ])
 
 // 本插件自己注册的端点：内部**逐个**自带 checkRequest（公开的那几个按设计放行）。
@@ -1095,6 +1104,7 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oidc/unbind',
   '/dsh-webui-oauth/oidc/callback',
   '/dsh-webui-oauth/oidc/logout',
+  '/dsh-webui-oauth/oauth-relay',
 ])
 
 /**
@@ -1149,6 +1159,100 @@ export function matchesPublicPath(path, patterns) {
     }
   }
   return false
+}
+
+// ---------------- 官方 DeepSeek 账号登录（远程回环回调中转） ----------------
+//
+// 上游 deepseek-account-platform 的 loginOrigin() **只接受**
+// http://localhost|127.0.0.1|[::1]:<port>（显式非零端口），不支持反代域名。
+// 远程部署下：
+//   1) 把 startSignIn 的 callbackOrigin 改写成回环地址（同 host 优先，保证 cookie）；
+//   2) 浏览器授权后会被重定向到 http://127.0.0.1:<port>/oauth/callback——
+//      用户机器上通常没有这个服务，页面打不开但地址栏里有完整回调 URL；
+//   3) 设置页的「回调中转」把该 URL 粘贴回来，插件在服务端**内部重放**给账号平台
+//      注册的 /oauth/callback handler（直接调原始 handler，跳过闸门）。
+//
+// 因此 /oauth/callback **不需要公开**：它仍受会话闸门保护；中转端点自己也要求会话。
+
+/** 判断一个 origin 是否是上游 loginOrigin() 接受的回环 HTTP origin。 */
+export function isLoopbackLoginOrigin(value) {
+  try {
+    const u = new URL(String(value || ''))
+    if (u.protocol !== 'http:') return false
+    if (!['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) return false
+    if (!u.port || Number(u.port) === 0) return false
+    if (u.pathname !== '/' || u.search || u.hash || u.username || u.password) return false
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * 校验用户粘贴回来的回调 URL，并抽出 query 串。
+ * 只接受 http://{localhost|127.0.0.1|[::1]}:<本机端口>/oauth/callback 且
+ * code/state 各恰好一个——既防 SSRF/开放重定向，也防误粘贴。
+ *
+ * @returns {{ ok: true, query: string } | { ok: false, error: string }}
+ */
+export function parseOAuthRelayUrl(raw, port) {
+  if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'invalid-url' }
+  let u
+  try { u = new URL(raw.trim()) } catch (e) { return { ok: false, error: 'invalid-url' } }
+  if (u.protocol !== 'http:') return { ok: false, error: 'invalid-url' }
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) return { ok: false, error: 'invalid-url' }
+  if (!u.port || Number(u.port) !== Number(port)) return { ok: false, error: 'invalid-url' }
+  if (u.pathname !== '/oauth/callback') return { ok: false, error: 'invalid-url' }
+  if (u.username || u.password || u.hash) return { ok: false, error: 'invalid-url' }
+  const codes = u.searchParams.getAll('code')
+  const states = u.searchParams.getAll('state')
+  if (codes.length !== 1 || states.length !== 1 || !codes[0]) return { ok: false, error: 'invalid-url' }
+  return { ok: true, query: u.searchParams.toString() }
+}
+
+/**
+ * 把官方账号登录的 callbackOrigin 桥接到回环地址。
+ * 版本兼容：deepseekAccount 服务不存在 / 方法签名变化时静默跳过，不影响其他功能。
+ *
+ * @returns {boolean} 是否注册了桥接
+ */
+export function installAccountLoginBridge(ctx) {
+  try {
+    if (!ctx || typeof ctx.inject !== 'function') return false
+    ctx.inject(['deepseekAccount'], (scoped) => {
+      try {
+        const account = scoped.deepseekAccount
+        if (!account || typeof account.startSignIn !== 'function') return
+        if (account.startSignIn.__dshWuaBridged === true) return
+        const raw = account.startSignIn
+        const original = raw.bind(account)
+        const bridged = function (client, callbackOrigin, loginSource) {
+          let origin = callbackOrigin
+          if (!isLoopbackLoginOrigin(origin)) {
+            // 本地访问：请求 Host 就是回环时优先用它（cookie 同 host，回调可直接命中）。
+            // 远程访问：回落到 127.0.0.1:<本机端口>，由用户把回调 URL 粘贴回来。
+            const host = (apiRequestStore.getStore() || {}).host || ''
+            const port = ctx.webServer && ctx.webServer.port
+            origin = isLoopbackHost(host) && /:\d+$/.test(String(host))
+              ? 'http://' + host
+              : 'http://127.0.0.1:' + (port || 3080)
+          }
+          return original(client, origin, loginSource)
+        }
+        bridged.__dshWuaBridged = true
+        account.startSignIn = bridged
+        try {
+          scoped.effect(() => () => {
+            if (account.startSignIn === bridged) account.startSignIn = raw
+          }, 'dsh-webui-oauth: account login bridge')
+        } catch (e) { /* ignore */ }
+        try { ctx.logger.info('[dsh-webui-oauth] deepseek account login bridge active (loopback callback)') } catch (e) { /* ignore */ }
+      } catch (e) { /* 账号平台结构变化：跳过 */ }
+    })
+    return true
+  } catch (e) {
+    return false
+  }
 }
 
 // ---------------- 远程访问信任（原 dsh-remote-trust 的可选内置） ----------------
@@ -1458,8 +1562,16 @@ function installRouteGate(ctx, checkRequest, log, options) {
         delete req.headers['sec-fetch-mode']
         delete req.headers['sec-fetch-dest']
       }
+      // 记录本次 /api 请求的 Host：官方 DeepSeek 登录的 startSignIn 需要据此
+      // 选择回环回调 origin（同一 host，cookie 才能对上）。仅 /api 需要。
+      if (route.path === API_PREFIX) {
+        return apiRequestStore.run({ host: (req.headers && req.headers.host) || '' }, () => original(req, res))
+      }
       return original(req, res)
     }
+    // 供「回调中转」在服务端内部重放 /oauth/callback：直接调用原始 handler，
+    // 绕过闸门的会话检查（中转端点自己已经做了 checkRequest）。
+    wrapped.__dshWuaOriginal = original
     route.handler = wrapped
     return () => { route.handler = original }
   }
@@ -2630,6 +2742,9 @@ export async function apply(ctx) {
 
   // 远程访问信任（可选）：反代域名下让设置页可用。默认关闭；tapIndex 缺失时安全降级。
   installRemoteTrust(ctx)
+
+  // 官方 DeepSeek 账号登录：把 callbackOrigin 桥接到回环地址（远程部署由中继端点完成）。
+  installAccountLoginBridge(ctx)
   if (!gate.ok()) {
     ctx.logger.error('[dsh-webui-oauth] ROUTE GATE INCOMPLETE — ' + gate.problems().join('; ')
       + '. /api and/or WebSocket may be unprotected; the gate will still wrap them if they register later.')
@@ -3631,6 +3746,74 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-oauth: oidc logout')
+
+  // 官方 DeepSeek 登录的「回调中转」：POST /dsh-webui-oauth/oauth-relay
+  //
+  // 远程部署下，浏览器授权后会被重定向到 http://127.0.0.1:<port>/oauth/callback
+  // （上游只允许回环回调），用户机器上通常没有这个服务。设置页让用户把地址栏
+  // 里的完整 URL 粘贴回来，这里在服务端内部重放给账号平台注册的 handler。
+  //
+  // 安全性：
+  //   - 端点本身要求插件会话（SELF_GATED_EXACT_PATHS，不公开）；
+  //   - 只接受本机端口的 /oauth/callback + 单个 code/state（防 SSRF/开放重定向）；
+  //   - state 与 PKCE 由账号平台校验，且一次性。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oauth-relay',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const parsed = parseOAuthRelayUrl(body.url, ctx.webServer.port)
+        if (!parsed.ok) {
+          sendJson(res, 200, { ok: false, error: parsed.error, hint: '请粘贴浏览器地址栏里完整的 http://127.0.0.1:<端口>/oauth/callback?... 地址' })
+          return
+        }
+        const route = ctx.webServer.exact && ctx.webServer.exact.get
+          ? ctx.webServer.exact.get('/oauth/callback')
+          : undefined
+        const handler = route && route.handler
+          ? (route.handler.__dshWuaOriginal || route.handler)
+          : null
+        if (typeof handler !== 'function') {
+          sendJson(res, 200, { ok: false, error: 'no-pending', hint: '没有进行中的官方登录，请先在设置 → 账号里点登录，再粘贴回调地址' })
+          return
+        }
+        const fakeReq = {
+          method: 'GET',
+          url: '/oauth/callback?' + parsed.query,
+          headers: Object.assign({}, req.headers || {}, { host: '127.0.0.1:' + ctx.webServer.port }),
+          socket: { remoteAddress: '127.0.0.1' },
+        }
+        const fakeRes = {
+          statusCode: 200, headers: {}, body: null,
+          writeHead(s, h) { this.statusCode = s; if (h) for (const k of Object.keys(h)) this.headers[String(k).toLowerCase()] = h[k] },
+          setHeader(k, v) { this.headers[String(k).toLowerCase()] = v },
+          getHeader(k) { return this.headers[String(k).toLowerCase()] },
+          end(b) { this.body = b === undefined ? '' : String(b) },
+          destroy() {},
+          on() { return this },
+        }
+        await handler(fakeReq, fakeRes)
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'oauth_relay', {
+          username: null, ip: meta.ip, ua: meta.ua,
+          detail: '已重放官方登录回调（状态 ' + fakeRes.statusCode + '）',
+        })
+        sendJson(res, 200, { ok: true, accepted: true })
+      } catch (e) {
+        sendJson(res, 500, { error: 'oauth-relay-failed' })
+      }
+    },
+  }), 'dsh-webui-oauth: oauth relay')
 
   // ---------------- 传输层拦截 ----------------
 

@@ -2,6 +2,50 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.7.4
+
+修正 0.7.3 对官方 DeepSeek 登录的处理：`/oauth/callback` **不再公开**，改为
+「回环回调 + 用户粘贴 + 服务端内部重放」；设置页改为卡片式布局并加入回调中转悬浮窗。
+
+### 安全修正：/oauth/callback 不再放行匿名访问
+
+0.7.3 把它加进公开白名单是错的：任何能访问该端点的人都可以触发一次换 token
+尝试（虽然 state/PKCE 会挡，但没有必要暴露）。现在：
+
+- `/oauth/callback` **不在** `PUBLIC_EXACT_PATHS`，仍受会话闸门保护；
+- 它由账号平台在登录开始时动态注册，晚注册同样会被闸门包装（回归断言）；
+- 闸门包装时把原始 handler 挂到 `__dshWuaOriginal`，仅供服务端内部重放使用。
+
+### 新增：官方 DeepSeek 登录的远程回调中转
+
+- **劫持 callbackOrigin**：包装 `deepseekAccount.startSignIn`，把域名 origin 改写成
+  `http://127.0.0.1:<本机端口>`（上游 `loginOrigin()` 只接受回环）；
+  本地回环访问保留原 origin（cookie 同 host，回调直接命中）。
+- **悬浮中转窗**：设置 → 身份认证 → 远程访问 →「打开回调中转窗口」，
+  把浏览器地址栏里的完整回调 URL 粘贴进去。
+- **服务端内部重放**：`POST /dsh-webui-oauth/oauth-relay`（要求会话）校验 URL
+  只为本机端口的 `/oauth/callback` + 单个 `code`/`state`，然后直接调用账号平台
+  注册的原始 handler；state/PKCE 仍由平台校验。防 SSRF / 开放重定向。
+- 版本兼容：`deepseekAccount` 服务不存在或方法变化时静默跳过；
+  `startSignIn` 重复安装不会二次包装。
+
+### 设置页重构（美化 + 优化）
+
+- 由一整列平铺表单改为 6 张卡片：概览 / 账号与密码 / OIDC 单点登录 /
+  OIDC 身份绑定 / 远程访问 / 最近登录记录；
+- 顶部徽章直接显示：认证、OIDC、绑定、仅允许 SSO、远程信任；
+- 字段按两列自适应网格排列，主操作收敛到卡片底部；
+- 新增「远程访问」卡片（远程信任状态 + 官方登录回调中转悬浮窗）；
+- 保持所有既有字段、回填规则（除密钥外全部预填）与错误提示不变。
+
+### 测试
+
+- 新增 `test/oauth-relay.test.mjs`（29 项）：回环 origin 判定、回调 URL 校验
+  （端口/host/路径/重复参数/hash）、startSignIn 桥接与防重复包装；
+- `test/gate-default-deny.test.mjs` 改为断言 `/oauth/callback` **匿名 401**、
+  带会话 200、原始 handler 可被中转调用；
+- 全量 22 个测试文件、587 项断言通过。
+
 ## 0.7.3
 
 整合 `dsh-remote-trust`，并确认与官方 DeepSeek 账号登录（0.2.1+）的兼容边界。

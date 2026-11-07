@@ -90,7 +90,7 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
 
 > **Since 0.6.7 the gate is a deny-by-default allowlist.** Previously only `/api` and `/plugins` were wrapped, but the webServer matches "exact first, then longest prefix" — a third-party route such as `/dsh-any-background/font` or `/dsh-550c-boot/update` is more specific than this plugin's `""` prefix and therefore won the match, bypassing the gate entirely (measured: anonymous requests read user fonts, wallpapers and image fingerprints with 200, while write endpoints returned 401 because they go through the RPC channel — "write-protected, read-naked"). A denylist can never keep up with the next plugin you install; a default-deny allowlist cannot miss.
 >
-> **The complete anonymous allowlist**: `/dsh-webui-oauth/login`, `/setup`, `/oidc/login`, `/oidc/callback`, `/oauth/callback`. Operators can extend it via `remote-web-ui.publicPaths` (see below).
+> **The complete anonymous allowlist**: `/dsh-webui-oauth/login`, `/setup`, `/oidc/login`, `/oidc/callback`. `/oauth/callback` (the official DeepSeek account callback) is **not** on it — it is protected by the session gate; on remote deployments the plugin's "callback relay" completes it instead (see "DeepSeek official account login"). Operators can extend the list via `remote-web-ui.publicPaths`.
 >
 > **When the session is invalid**: a browser navigation (`Accept: text/html`) gets a 302 back to the login page; `fetch`/XHR calls get a 401, which the client plugin intercepts and turns into a redirect to the login page. Visiting the login page with a valid session redirects to the app root (carrying the core launch token, so the core cookie exchange still happens).
 
@@ -417,19 +417,21 @@ wired into `npm test`).
 
 ## Known limits
 
-- **DeepSeek official account login (0.2.1+)**: `/oauth/callback` is on the public allowlist
-  (including the route registered dynamically when a login starts), so the anonymous callback is never
-  blocked by the gate. However, upstream `@deepseek-ai/dsh-deepseek-account-platform`'s
-  `loginOrigin()` **only accepts** `http://localhost:<port>`, `http://127.0.0.1:<port>` and
-  `http://[::1]:<port>` with an explicit non-zero port; reverse-proxied domains are explicitly
-  unsupported. Therefore:
-  - via `http://127.0.0.1:3080` the official login completes normally;
-  - via a domain it fails with a `protocol` error (upstream limitation, not this plugin). Complete the
-    login once through `http://127.0.0.1:3080` or an SSH local forward — the account token is stored in
-    the host credential store and keeps working through the domain afterwards;
-  - logging in directly on a domain requires upstream to relax that rule (or a fork of the account
-    platform). This plugin deliberately does not monkey-patch core internals, which would break on
-    every upgrade.
+- **DeepSeek official account login (0.2.1+, remote callback relay)**: `/oauth/callback` is **not**
+  a public path — it stays behind the session gate. Upstream `dsh-deepseek-account-platform`'s
+  `loginOrigin()` only accepts `http://localhost:<port>`, `http://127.0.0.1:<port>` and
+  `http://[::1]:<port>` (explicit non-zero port) and rejects reverse-proxied domains. The plugin:
+  - bridges the official login's `callbackOrigin`: loopback access keeps its own origin (cookie host
+    matches, the callback lands directly); a domain origin is rewritten to
+    `http://127.0.0.1:<local port>`;
+  - after authorization the browser is redirected to that loopback callback — usually unreachable from
+    a remote machine, but the full URL stays in the address bar;
+  - Settings → Authentication → Remote access → "Open callback relay window", paste the URL; the plugin
+    **replays it internally** to the account platform's registered `/oauth/callback` handler (state and
+    PKCE are still validated by the platform) to finish the token exchange;
+  - the relay endpoint requires the plugin session and accepts only the local port's
+    `/oauth/callback` with exactly one `code`/`state` (SSRF / open-redirect protection);
+  - on `http://127.0.0.1:3080` the official login already completes directly; no relay needed.
 - **DSH Desktop**: `dsh-desktop-*` marker pass-through is supported (markers survive login and
   re-login), but upstream 0.3.6's **host carrier bridge is intentionally not included**. That bridge
   decides "loopback" purely from the socket address, and this deployment sits behind an nginx proxy on

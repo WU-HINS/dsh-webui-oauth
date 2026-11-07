@@ -142,12 +142,16 @@ console.log('\n— 2. 已注册的第三方读接口必须被默认拒绝 —')
 
   console.log('  · 公开白名单：匿名放行')
   eq('登录页匿名可访问', (await call(login)).status, 200)
-  eq('OAuth 回跳匿名可访问', (await call(oauthCb)).status, 200)
+
+  console.log('  · 官方登录回调：受会话保护，不放行匿名')
+  eq('OAuth 回跳匿名被拒', (await call(oauthCb)).status, 401)
+  eq('OAuth 回跳带会话放行', (await call(oauthCb, authed())).status, 200)
 
   console.log('  · 本插件自管端点：不套通用闸门（内部自行鉴权）')
   eq('login 未被通用闸门替换', login.handler, loginOrig)
   eq('configure 未被通用闸门替换（其 handler 自带 checkRequest）', configure.handler, configureOrig)
-  eq('oauth/callback 未被替换（属公开白名单）', oauthCb.handler, oauthOrig)
+  eq('oauth/callback 被闸门包装（可通过 __dshWuaOriginal 重放）',
+    oauthCb.handler !== oauthOrig && typeof oauthCb.handler.__dshWuaOriginal, 'function')
 
   console.log('  · fallback 也必须上闸门')
   eq('匿名落到 fallback 被拒', (await call({ handler: ws.fallback })).status, 401)
@@ -216,11 +220,12 @@ console.log('\n— 2b. 未认证响应形态：页面跳登录、接口 401 —'
   gate.undo()
 }
 
-// ---------------- 2c. 官方 DeepSeek 登录的回调：晚注册也必须保持公开 ----------------
+// ---------------- 2c. 官方 DeepSeek 登录回调：晚注册，且**不公开** ----------------
 //
-// deepseek-account-platform 在**用户点击登录时**才注册 /oauth/callback（exact）。
-// 它必须在白名单里，否则匿名回调会被 401 拦掉，官方登录必然失败。
-console.log('\n— 2c. 官方登录回调（晚注册）保持公开 —')
+// deepseek-account-platform 在用户点击登录时才注册 /oauth/callback（exact）。
+// 它不在白名单里：匿名访问必须被闸门拦下（远程部署由插件的中转端点代为完成）。
+// 闸门包装时会把原始 handler 挂到 __dshWuaOriginal 上，供中转端点直接调用。
+console.log('\n— 2c. 官方登录回调（晚注册）必须受会话保护 —')
 {
   const ws = makeWebServer()
   ws.prefixes.set('/api', route('prefix', '/api'))
@@ -235,8 +240,15 @@ console.log('\n— 2c. 官方登录回调（晚注册）保持公开 —')
 
   const res = makeRes()
   await cb.handler(anon(), res)
-  eq('晚注册的 /oauth/callback 不要求会话', res.status, 200)
-  eq('未被计入已包装路由', gate.stats().wrappedExact, 0)
+  eq('匿名访问晚注册的 /oauth/callback 被拒', res.status, 401)
+  eq('已计入已包装路由', gate.stats().wrappedExact, 1)
+
+  const res2 = makeRes()
+  await cb.handler(authed(), res2)
+  eq('带会话可通过', res2.status, 200)
+
+  eq('包装器保留了原始 handler（供中转重放）',
+    typeof cb.handler.__dshWuaOriginal, 'function')
 
   gate.undo()
 }
