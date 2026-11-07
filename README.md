@@ -435,7 +435,8 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 - **没有过期时间**，只有显式吊销（`POST /dsh-webui-oauth/devices/revoke`）才失效；
 - 设置页「设备会话（App / CLI）」单独列表，可逐个吊销；
 - 浏览器会话也有独立列表（系统 / 浏览器 / 设备指纹 / 最近活跃），可单独吊销；
-  标识按**每个 HTTP 请求**实时刷新，不是登录时的快照；
+  标识按**每个 HTTP 请求**实时刷新，不是登录时的快照；同指纹（UA+IP）的会话在列表里去重，
+  只显示当前/最近活跃的一条，并标注「同指纹 N 个旧会话」，可一键清理；
 - 设备 Bearer 直接通过 `checkRequest`，可访问 `/api`、`/plugins`、WebSocket 与静态资源；
 - 设备 Bearer **不能**做设备管理（列表 / 吊销 / 批准新设备只允许浏览器会话）。
 

@@ -198,13 +198,33 @@ try {
     })
     eq('拒绝协议相对 next', badNext.json && badNext.json.redirect === '//evil.example/', false)
 
+    // 另造一个不同指纹的会话（Firefox / Windows）
+    const firefoxUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0'
+    const otherLogin = await call('/dsh-webui-oauth/login', {
+      url: '/dsh-webui-oauth/login', method: 'POST',
+      headers: { ...jsonHeaders(), 'user-agent': firefoxUa },
+      body: JSON.stringify({ username: 'admin', password: 'Admin#Passw0rd!' }),
+    })
+    eq('不同浏览器登录成功', !!otherLogin.cookie, true)
+
     const list = await call('/dsh-webui-oauth/sessions', { headers: { cookie: 'dsh_wua_session=' + s2 } })
     eq('会话列表可用', list.json && list.json.ok, true)
-    eq('列表包含会话', list.json && list.json.sessions.length >= 2, true)
-    eq('标记了当前会话', list.json && list.json.sessions.some((x) => x.current), true)
+    const currentEntry = list.json && list.json.sessions.find((x) => x.current)
+    eq('标记了当前会话', !!currentEntry, true)
+    eq('同指纹会话已去重', currentEntry && currentEntry.duplicates >= 1, true)
+    eq('列表按指纹分组', list.json && list.json.sessions.length, 2)
     const other = list.json && list.json.sessions.find((x) => !x.current)
+    eq('不同浏览器单独一条', other && other.browser, 'Firefox 131')
     eq('会话带系统字段', typeof (other && other.os), 'string')
     eq('会话带指纹字段', typeof (other && other.fingerprint), 'string')
+
+    if (other) {
+      const revokeOne = await call('/dsh-webui-oauth/sessions/revoke-one', {
+        url: '/dsh-webui-oauth/sessions/revoke-one', method: 'POST', headers: jsonHeaders(s2),
+        body: JSON.stringify({ id: other.id }),
+      })
+      eq('单条吊销成功', revokeOne.json && revokeOne.json.ok, true, revokeOne.res.body)
+    }
 
     // 浏览器标识以 HTTP 请求为准：同一会话换一个 UA 发请求，列表应立即反映。
     const chromeUa = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
@@ -215,13 +235,6 @@ try {
     const current = list2.json && list2.json.sessions.find((x) => x.current)
     eq('浏览器标识实时更新', current && current.browser, 'Chrome 130')
     eq('系统标识实时更新', current && current.os, 'Linux')
-    if (other) {
-      const revokeOne = await call('/dsh-webui-oauth/sessions/revoke-one', {
-        url: '/dsh-webui-oauth/sessions/revoke-one', method: 'POST', headers: jsonHeaders(s2),
-        body: JSON.stringify({ id: other.id }),
-      })
-      eq('单条吊销成功', revokeOne.json && revokeOne.json.ok, true, revokeOne.res.body)
-    }
   }
 
   console.log('\n— 4. 修改配置（当前密码验证 + TTL）—')

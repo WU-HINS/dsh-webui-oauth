@@ -3263,6 +3263,16 @@ export async function apply(ctx) {
       browserName: parsed.browser,
       device: parsed.device,
     })
+    // 同一浏览器（UA+IP 相同）且已 60 秒没动静的旧会话：视为孤儿，登录时清掉。
+    // 仍活跃的同指纹会话保留（可能是另一台同网段设备），列表会标注"同指纹 N 个"。
+    const fp = sessionFingerprint({ ua: meta.ua, ip: meta.ip })
+    const stale = []
+    for (const [tok, old] of sessions.live) {
+      if (tok === token) continue
+      if (sessionFingerprint(old) !== fp) continue
+      if (now - (old.lastSeenAt || old.createdAt || 0) > 60000) stale.push(tok)
+    }
+    for (const tok of stale) sessions.delete(tok)
     return { token, maxAge: ttl > 0 ? ttl * 3600 : undefined }
   }
 
@@ -3744,8 +3754,24 @@ export async function apply(ctx) {
             fingerprint: sessionFingerprint(s),
           })
         }
-        out.sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
-        sendJson(res, 200, { ok: true, sessions: out })
+        // 同指纹去重：同一浏览器（UA+IP 相同）只展示一条。
+        // 优先当前会话，其次最近活跃；其余作为 duplicateIds 返回，供前端一键清理。
+        const groups = new Map()
+        for (const s of out) {
+          const key = s.fingerprint || ('id:' + s.id)
+          if (!groups.has(key)) groups.set(key, [])
+          groups.get(key).push(s)
+        }
+        const deduped = []
+        for (const list of groups.values()) {
+          list.sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
+          const keep = { ...list[0] }
+          keep.duplicates = list.length - 1
+          keep.duplicateIds = list.slice(1).map((x) => x.id)
+          deduped.push(keep)
+        }
+        deduped.sort((a, b) => (b.current ? 1 : 0) - (a.current ? 1 : 0) || (b.lastSeenAt || 0) - (a.lastSeenAt || 0))
+        sendJson(res, 200, { ok: true, sessions: deduped, total: out.length })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
       }
