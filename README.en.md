@@ -401,6 +401,7 @@ wired into `npm test`).
 
 ## Known limits
 
+- **Fallback shape on dsh 0.2.2-rc.1**: since that version `webServer.fallback` may be `{ resource }` (that is how `dsh-host-frontend-static` registers it) instead of a function. The plugin now handles function / `{ resource }` / `{ handler }`; a resource fallback is gated as well. If `/` returns an empty `500` after upgrading (nginx logs `500 0`), make sure the plugin is ≥ 0.7.1.
 - **Inherent runtime-wrapping window**: between a route-object replacement (service hot-reload) and the next rescan (≤10s) there is an unprotected window; the fail-closed check on enabling covers the "initially exposed" case, so this window only affects hot-reload during runtime.
 - **WebSocket and `trustedHosts`**: in reverse-proxy / LAN deployments (non-loopback Host), WS downlinks need the public hostname added to `client-connection.trustedHosts` in the DSH config (see "Architecture").
 - **Proxy on a different host**: if the reverse proxy is not on the same machine as DSH (non-loopback peer), the proxy headers are not trusted and rate limiting aggregates per proxy IP (degrades to a global bucket).

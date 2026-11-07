@@ -2,6 +2,42 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.7.1
+
+兼容 dsh **0.2.2-rc.1**：`webServer.fallback` 从函数改成了 `{ resource }`。
+
+### 修复：访问 `/` 返回 500 空响应（nginx 日志 `500 0`）
+
+- **现象**：升级到 dsh 0.2.2-rc.1 后，访问 `/` 在完成核心 token 交换后返回
+  `500`，body 为空；nginx 访问日志表现为 `500 0`。
+- **原因**：0.2.2-rc.1 起 `webServer.fallback` 不再一定是函数——
+  `dsh-host-frontend-static` 注册的是 `{ resource }`（Fetch 风格
+  `resource(request, peer) -> Response`）。插件仍按 `await fallback(req, res)`
+  调用，抛 `TypeError: fallback is not a function`，被外层 `catch` 兜成
+  `500` + 空 body。
+- **修复**：新增 `serveFallback()` 统一分派三种形状：
+  1. 函数（旧核心）；
+  2. `{ resource }` + `webServer.serveResource`（0.2.2-rc.1+）；
+  3. `{ handler }`（部分中间版本）。
+  没有 fallback 时返回 `false`，由调用方 404——不再把"形状不匹配"误报成 500。
+
+### 安全：资源型 fallback 也必须上闸门
+
+此前 `wrapExistingFallback` 只处理 `typeof === 'function'`，遇到 `{ resource }`
+直接跳过，等于把兜底入口留给匿名请求。现在：
+
+- `resource(request, peer)` 会被包装：从 Fetch Request 的 `cookie` 头取会话，
+  未登录返回 `401 Response`，已登录原样放行；
+- `registerFallback` 注册时的三种形状都会在注册那一刻上闸门；
+- `undo` 会把 `resource` / `handler` 原样还原。
+
+### 测试
+
+- 新增 `test/fallback-shape.test.mjs`（19 项）：三种形状分派、无 fallback /
+  未知形状 / 缺 `serveResource` 均不抛异常、资源型 fallback 的匿名拒绝与
+  登录放行、`undo` 还原。
+- 全量 18 个测试文件、488 项断言通过。
+
 ## 0.7.0
 
 新增**「仅允许 SSO」**开关；同时修复一个会把 OIDC 绑定悄悄弄丢的老问题。

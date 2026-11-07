@@ -1154,6 +1154,41 @@ function wantsHtml(req) {
   }
 }
 
+/**
+ * 把请求交给 webServer 的 fallback。
+ *
+ * 0.2.2-rc.1 起 fallback 不再一定是函数：dsh-host-frontend-static 注册的是
+ * `{ resource }`（Fetch 风格的 `resource(request, peer) -> Response`）。
+ * 旧代码直接 `await fallback(req, res)` 会抛 TypeError（fallback is not a function），
+ * 被外层 catch 兜成 `500` + 空 body——nginx 访问日志里就是 `500 0`。
+ *
+ * 这里统一三种形状：
+ *   1. 函数（旧核心 / 第三方 handler）；
+ *   2. `{ resource }` + webServer.serveResource（0.2.2-rc.1+）；
+ *   3. `{ handler }`（部分中间版本）。
+ *
+ * @returns {Promise<boolean>} 是否已由 fallback 处理；false 表示没有 fallback，
+ *   调用方应自行返回 404（不要把"没有 fallback"误报成 500）。
+ */
+export async function serveFallback(ctx, req, res) {
+  const ws = ctx && ctx.webServer
+  if (!ws) return false
+  const fallback = ws.fallback
+  if (typeof fallback === 'function') {
+    await fallback(req, res)
+    return true
+  }
+  if (fallback && typeof fallback.resource === 'function' && typeof ws.serveResource === 'function') {
+    await ws.serveResource(req, res, new URL(req.url || '/', 'http://x'), fallback.resource)
+    return true
+  }
+  if (fallback && typeof fallback.handler === 'function') {
+    await fallback.handler(req, res)
+    return true
+  }
+  return false
+}
+
 function rejectUpgrade401(socket) {
   try {
     socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 13\r\n\r\nunauthorized\n')
@@ -1373,7 +1408,12 @@ function installRouteGate(ctx, checkRequest, log, options) {
   // ---------------- fallback 也要包 ----------------
   // fallback 是"未被任何具名路由认领"的兜底处理器。它同样可能被第三方插件占据，
   // 若不管，攻击者只要找到一个不存在的路径就可能落到未鉴权的 fallback 上。
-  const wrappedFallbacks = new WeakSet()
+  //
+  // 0.2.2-rc.1 起 fallback 还可能是 { resource }（Fetch 风格）：既不能当函数调用
+  // （TypeError），也不能放任它绕过闸门。两种形状分别包装。
+  const wrappedFallbacks = new WeakSet()   // 原始 handler 函数
+  const wrappedResources = new WeakSet()   // 原始 resource 函数
+
   const gateFallback = (handler) => {
     if (typeof handler !== 'function' || wrappedFallbacks.has(handler)) return handler
     const original = handler
@@ -1385,23 +1425,71 @@ function installRouteGate(ctx, checkRequest, log, options) {
       }
       return original(req, res)
     }
-    wrappedFallbacks.add(gated)
+    wrappedFallbacks.add(original)
     fallbackWrapped = true
     log('wrapped fallback handler')
     return gated
   }
 
-  // 已经就位的 fallback：直接替换属性（保留原函数以便 undo）。
+  const gateResource = (resource) => {
+    if (typeof resource !== 'function' || wrappedResources.has(resource)) return resource
+    const original = resource
+    const gated = async (request, peer) => {
+      // resource 收到的是 Fetch Request；checkRequest 只依赖 cookie 头。
+      const cookie = request && request.headers && typeof request.headers.get === 'function'
+        ? (request.headers.get('cookie') || '')
+        : ''
+      const headers = { cookie }
+      if (!checkRequest({ method: request && request.method, url: request && request.url, headers })) {
+        return new Response('unauthorized', {
+          status: 401,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        })
+      }
+      return original(request, peer)
+    }
+    wrappedResources.add(original)
+    fallbackWrapped = true
+    log('wrapped fallback resource')
+    return gated
+  }
+
+  // 已经就位的 fallback：按形状替换（保留原值以便 undo）。
   const wrapExistingFallback = () => {
     const current = ws.fallback
-    if (typeof current !== 'function') return
-    if (wrappedFallbacks.has(current)) return
-    if (current.__dshWuaGated === true) return
-    const gated = gateFallback(current)
-    if (gated === current) return
-    gated.__dshWuaGated = true
-    ws.fallback = gated
-    undos.push(() => { if (ws.fallback === gated) ws.fallback = current })
+    if (typeof current === 'function') {
+      if (wrappedFallbacks.has(current)) return
+      if (current.__dshWuaGated === true) return
+      const gated = gateFallback(current)
+      if (gated === current) return
+      gated.__dshWuaGated = true
+      ws.fallback = gated
+      undos.push(() => { if (ws.fallback === gated) ws.fallback = current })
+      return
+    }
+    if (current && typeof current === 'object') {
+      if (typeof current.resource === 'function') {
+        if (wrappedResources.has(current.resource)) { fallbackWrapped = true; return }
+        if (current.resource.__dshWuaGated === true) return
+        const original = current.resource
+        const gated = gateResource(original)
+        if (gated === original) return
+        gated.__dshWuaGated = true
+        current.resource = gated
+        undos.push(() => { if (current.resource === gated) current.resource = original })
+        return
+      }
+      if (typeof current.handler === 'function') {
+        if (wrappedFallbacks.has(current.handler)) { fallbackWrapped = true; return }
+        if (current.handler.__dshWuaGated === true) return
+        const original = current.handler
+        const gated = gateFallback(original)
+        if (gated === original) return
+        gated.__dshWuaGated = true
+        current.handler = gated
+        undos.push(() => { if (current.handler === gated) current.handler = original })
+      }
+    }
   }
 
   // ---------------- 注册时即拦截（消除重扫窗口） ----------------
@@ -1432,8 +1520,28 @@ function installRouteGate(ctx, checkRequest, log, options) {
   // registerFallback 走的是属性赋值而非 Map，单独接管。
   if (typeof ws.registerFallback === 'function') {
     const originalRegisterFallback = ws.registerFallback
-    ws.registerFallback = function patchedRegisterFallback (handler) {
-      return originalRegisterFallback.call(this, gateFallback(handler))
+    ws.registerFallback = function patchedRegisterFallback (fallback) {
+      // 三种形状都要上闸门：函数 / { resource } / { handler }。
+      try {
+        if (typeof fallback === 'function') {
+          fallback = gateFallback(fallback)
+        } else if (fallback && typeof fallback === 'object') {
+          if (typeof fallback.resource === 'function' && !wrappedResources.has(fallback.resource)) {
+            const gated = gateResource(fallback.resource)
+            if (gated !== fallback.resource) {
+              gated.__dshWuaGated = true
+              fallback.resource = gated
+            }
+          } else if (typeof fallback.handler === 'function' && !wrappedFallbacks.has(fallback.handler)) {
+            const gated = gateFallback(fallback.handler)
+            if (gated !== fallback.handler) {
+              gated.__dshWuaGated = true
+              fallback.handler = gated
+            }
+          }
+        }
+      } catch (e) { /* 包装失败不阻断注册，靠重扫兜底 */ }
+      return originalRegisterFallback.call(this, fallback)
     }
     undos.push(() => { ws.registerFallback = originalRegisterFallback })
   }
@@ -3399,11 +3507,9 @@ export async function apply(ctx) {
               return
             }
           }
-          const fallback = ctx.webServer.fallback
-          if (fallback !== undefined) {
-            await fallback(req, res)
-            return
-          }
+          // fallback 可能是函数，也可能是 { resource }（0.2.2-rc.1+）。
+          // 交给 serveFallback 统一分派，避免 TypeError → 500 空响应。
+          if (await serveFallback(ctx, req, res)) return
           res.writeHead(404)
           res.end()
           return

@@ -411,6 +411,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
 ## 已知边界
 
+- **dsh 0.2.2-rc.1 的 fallback 形状**：该版本起 `webServer.fallback` 可能是 `{ resource }`（`dsh-host-frontend-static` 就是这样注册的），而不再是函数。插件已兼容函数 / `{ resource }` / `{ handler }` 三种形状；资源型 fallback 同样会被闸门包装。若升级后 `/` 返回 `500` 且 body 为空（nginx 日志 `500 0`），请确认插件版本 ≥ 0.7.1。
 - **运行时包装的固有窗口**：路由对象被替换（服务热重载）到下一次重扫之间（≤10s）存在未保护窗口；启用认证时的 fail-closed 已挡住「初始裸奔」，此窗口仅影响运行中的热重载场景。
 - **WS 与 trustedHosts**：反代/局域网（非回环 Host）下，WS 下行需在 dsh 配置 `client-connection.trustedHosts` 中加入对外域名（见「架构」节）。
 - **反代不同机**：若反代与 DSH 不在同一台机器（对端非回环），代理头不被信任，限流将按代理 IP 聚合（退化为全局桶）。
