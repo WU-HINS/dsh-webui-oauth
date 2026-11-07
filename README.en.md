@@ -429,10 +429,10 @@ wired into `npm test`).
     `http://127.0.0.1:<local port>`;
   - after authorization the browser is redirected to that loopback callback — usually unreachable from
     a remote machine, but the full URL stays in the address bar;
-  - click the always-on "DeepSeek 登录回调" floating button at the bottom-right of any page and paste
-    the URL; the plugin **replays it internally** to the account platform's registered
-    `/oauth/callback` handler (state and PKCE are still validated by the platform) to finish the
-    token exchange;
+  - the official "Waiting for sign in" dialog grows a callback paste box (the plugin injects it into
+    that dialog via MutationObserver; there is no separate floating entry); paste the URL and the plugin
+    **replays it internally** to the account platform's registered `/oauth/callback` handler (state and
+    PKCE are still validated by the platform) to finish the token exchange;
   - the relay endpoint requires the plugin session and accepts only the local port's
     `/oauth/callback` with exactly one `code`/`state` (SSRF / open-redirect protection);
   - on `http://127.0.0.1:3080` the official login already completes directly; no relay needed.
