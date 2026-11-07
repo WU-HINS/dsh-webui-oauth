@@ -540,31 +540,31 @@ console.log('\n— 5c. SSO 复验令牌可用于保存配置（不提供密码�
       { cookie: 'dsh_wua_oidc_state=' + stCookie }), cb)
   eq('复验回调 302 回应用', cb.status, 302, String(cb.status))
   const loc = String(cb.headers.location || '')
-  const token = new URL(loc, 'http://x').searchParams.get('oidcreauth')
-  eq('回执带一次性复验令牌', !!token, loc)
+  eq('回执只带状态标记（不把令牌放进 URL）',
+    new URL(loc, 'http://x').searchParams.get('oidcreauth'), '1')
 
-  // ③ 用令牌保存配置（current 留空）
+  // ③ 复验结果记在会话上：用同一个会话保存配置（current 留空）
   const saved = await call('/dsh-webui-oauth/configure', {
     url: '/dsh-webui-oauth/configure', method: 'POST',
     headers: { 'content-type': 'application/json', ...H },
     body: JSON.stringify({
-      username: 'admin', current: '', reauthToken: token, ttl: 12,
+      username: 'admin', current: '', ttl: 12,
       oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
     }),
   })
-  eq('用复验令牌保存成功（无需密码）', saved.json && saved.json.ok === true, saved.res.body)
+  eq('用会话复验保存成功（无需密码）', saved.json && saved.json.ok === true, saved.res.body)
   eq('保存后绑定仍在', JSON.parse(credsText || '{}').boundSub, 'sub-alice')
 
-  // ④ 令牌一次性：再用一次应回落到密码校验并失败
+  // ④ 复验是一次性的：同一会话再保存一次应回落到密码校验并失败
   const replay = await call('/dsh-webui-oauth/configure', {
     url: '/dsh-webui-oauth/configure', method: 'POST',
     headers: { 'content-type': 'application/json', ...H },
     body: JSON.stringify({
-      username: 'admin', current: '', reauthToken: token, ttl: 12,
+      username: 'admin', current: '', ttl: 12,
       oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
     }),
   })
-  eq('复验令牌不可重放', replay.json && replay.json.error, 'current-invalid')
+  eq('会话复验不可重放', replay.json && replay.json.error, 'current-invalid')
 }
 
 console.log('\n— 6. 解绑：密码错误被拒，正确则清空并立即失效 —')

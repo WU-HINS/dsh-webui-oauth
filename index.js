@@ -2691,6 +2691,31 @@ export async function apply(ctx) {
 
   const SESSION_TTL_MS = SESSION_BROWSER_TTL_MS
 
+  /** 取当前请求对应的会话记录（不做续期），无效/过期返回 null。 */
+  function sessionOf(req) {
+    const token = cookieOf(req, COOKIE_NAME)
+    if (!token) return null
+    const s = sessions.get(token)
+    if (!s) return null
+    if (s.expiresAt <= Date.now()) {
+      sessions.delete(token)
+      return null
+    }
+    return s
+  }
+
+  /** 该会话是否在 2 分钟内通过过 SSO 复验。 */
+  function sessionReauthOk(req) {
+    const s = sessionOf(req)
+    return !!(s && typeof s.reauthAt === 'number' && Date.now() - s.reauthAt < REAUTH_WINDOW_MS)
+  }
+
+  /** 复验是一次性的：敏感操作成功后清掉时间戳。 */
+  function clearSessionReauth(req) {
+    const s = sessionOf(req)
+    if (s) delete s.reauthAt
+  }
+
   function createSession(username, ttl) {
     const token = randomBytes(24).toString('hex')
     const ttlMs = ttl > 0 ? ttl * 3600 * 1000 : SESSION_TTL_MS
@@ -2832,30 +2857,20 @@ export async function apply(ctx) {
   // 必须在后台定时器使用 purge 之前定义。
   const oidcStateStore = makeOidcStateStore()
 
-  // 敏感操作（保存配置 / 禁用 / 解绑）的 SSO 复验令牌：
-  // 一次性、2 分钟。密码被禁用（仅允许 SSO）时，用户仍可用 SSO 完成二次验证。
-  const reauthTokens = new Map()
-  const REAUTH_TTL_MS = 2 * 60 * 1000
-  const mintReauthToken = (username) => {
-    const token = randomBytes(16).toString('hex')
-    reauthTokens.set(token, { username, expiresAt: Date.now() + REAUTH_TTL_MS })
-    return token
-  }
-  const consumeReauthToken = (token) => {
-    if (typeof token !== 'string' || !token) return null
-    const rec = reauthTokens.get(token)
-    if (!rec) return null
-    reauthTokens.delete(token)
-    if (rec.expiresAt <= Date.now()) return null
-    return rec
-  }
+  // SSO 复验通过后，直接在**当前会话**上记一个时间戳（2 分钟有效），
+  // 不再签发独立令牌、也不经过 URL 传递。敏感操作直接检查会话。
+  const REAUTH_WINDOW_MS = 2 * 60 * 1000
   const purgeExpiredOidcStates = oidcStateStore.purge
 
   // 后台任务：过期会话清理 + enabled 状态刷新
   const bgTimer = setInterval(async () => {
     const now = Date.now()
-    for (const [k, s] of sessions.live) if (s.expiresAt <= now) sessions.delete(k)
-    for (const [k, v] of reauthTokens) if (v.expiresAt <= now) reauthTokens.delete(k)
+    for (const [k, s] of sessions.live) {
+      if (s.expiresAt <= now || (typeof s.reauthAt === 'number' && now - s.reauthAt >= REAUTH_WINDOW_MS)) {
+        if (s.expiresAt <= now) sessions.delete(k)
+        else delete s.reauthAt
+      }
+    }
     purgeExpiredOidcStates()
     try {
       const creds = await readCredentials(ctx)
@@ -3124,6 +3139,8 @@ export async function apply(ctx) {
           sessionsPersisted: sessions.ok,
           // 远程访问信任（可选）：是否已注入 ownsHost。
           remoteTrust: remoteTrustFlag,
+          // 当前会话是否在 2 分钟内通过过 SSO 复验（保存/禁用/解绑可直接进行）。
+          reauthActive: sessionReauthOk(req),
           // 核心兜底席位形态（handler | resource | absent | unknown）：核心升级后
           // 如果这里变成 unknown，文档请求会 404 —— 排查时先看这个字段。
           fallback: fallbackShape(ctx.webServer),
@@ -3243,8 +3260,8 @@ export async function apply(ctx) {
           }
         }
         if (wasEnabled) {
-          // 支持 SSO 复验令牌（「仅允许 SSO」时密码登录入口不可用）
-          const reauthOk = !!consumeReauthToken(body.reauthToken)
+          // 支持 SSO 复验（「仅允许 SSO」时密码登录入口不可用）：复验结果记在会话上
+          const reauthOk = sessionReauthOk(req)
           const curValid = reauthOk || (current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
           if (!curValid) {
             await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
@@ -3383,6 +3400,7 @@ export async function apply(ctx) {
         if (!keepPassword) detailParts.push('密码已修改')
         if (body.ttl !== undefined) detailParts.push('有效期已修改')
         await auditLog(ctx, 'configure_success', { username, ip: meta.ip, ua: meta.ua, detail: detailParts.length ? detailParts.join('，') : null })
+        clearSessionReauth(req)
         sendJson(res, 200, { ok: true })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -3412,7 +3430,7 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: true })
           return
         }
-        const reauthOk = !!consumeReauthToken(body.reauthToken)
+        const reauthOk = sessionReauthOk(req)
         const curValid = reauthOk || (current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
         if (!curValid) {
           await auditLog(ctx, 'disable_failure', { username: creds.username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
@@ -3498,7 +3516,10 @@ export async function apply(ctx) {
     const state = oidcRandom(24)
     const nonce = oidcRandom(24)
     const verifier = oidcRandom(32)
-    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose })
+    // 复验要绑定到发起它的浏览器的**会话**：回调时直接把 reauthAt 记在该会话上，
+    // 不再签发独立令牌、也不把令牌放进 URL。
+    const sessionToken = purpose === 'reauth' ? cookieOf(req, COOKIE_NAME) : null
+    oidcStateStore.put(state, { nonce, verifier, redirectUri, purpose, sessionToken })
     const authUrl = new URL(disc.metadata.authorization_endpoint)
     authUrl.searchParams.set('response_type', 'code')
     authUrl.searchParams.set('client_id', o.clientId)
@@ -3629,7 +3650,7 @@ export async function apply(ctx) {
         const creds = await readCredentials(ctx)
         const meta = requestMeta(req)
         const current = String(body.current || '')
-        const reauthOk = !!consumeReauthToken(body.reauthToken)
+        const reauthOk = sessionReauthOk(req)
         const curValid = reauthOk || (current && creds && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
         if (!curValid) {
           await auditLog(ctx, 'oidc_unbind_failure', { username: creds && creds.username ? creds.username : null, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
@@ -3662,6 +3683,7 @@ export async function apply(ctx) {
         await writeCredentials(ctx, next)
         await refreshSsoOnly(next)
         await auditLog(ctx, 'oidc_unbind_success', { username: creds.username, ip: meta.ip, ua: meta.ua })
+        clearSessionReauth(req)
         sendJson(res, 200, { ok: true, bound: false })
       } catch (e) {
         sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
@@ -3793,9 +3815,16 @@ export async function apply(ctx) {
             redirectBackToApp(ctx, req, res, 'oidcerr=sub-mismatch', clearStateCookie)
             return
           }
-          const token = mintReauthToken(rawSub)
+          // 把复验结果记到发起登录的那个会话上（2 分钟内有效）。
+          const target = st.sessionToken ? sessions.get(st.sessionToken) : null
+          if (!target || target.expiresAt <= Date.now()) {
+            await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: '复验时会话已失效' })
+            redirectBackToApp(ctx, req, res, 'oidcerr=session-expired', clearStateCookie)
+            return
+          }
+          target.reauthAt = Date.now()
           await auditLog(ctx, 'oidc_reauth_success', { username: auditName, ip: meta.ip, ua: meta.ua })
-          redirectBackToApp(ctx, req, res, 'oidcreauth=' + token, clearStateCookie)
+          redirectBackToApp(ctx, req, res, 'oidcreauth=1', clearStateCookie)
           return
         }
 
