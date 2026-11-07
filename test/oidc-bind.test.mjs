@@ -511,6 +511,62 @@ console.log('\n— 5b. 绑定成功后必须回到应用，而不是停在 JSON 
   eq('sub 已落库', saved.boundSub === 'sub-alice', String(saved.boundSub))
 }
 
+console.log('\n— 5c. SSO 复验令牌可用于保存配置（不提供密码）—')
+{
+  credsText = JSON.stringify({ ...baseCreds, boundSub: 'sub-alice' })
+  oidcText = JSON.stringify({
+    v: 1,
+    oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+  })
+  const session = await loginLocal()
+  const H = { cookie: 'dsh_wua_session=' + session }
+
+  // ① 发起复验：应 302 到 IdP
+  const reauthRes = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/reauth').handler(
+    makeReq('/dsh-webui-oauth/oidc/reauth', H), reauthRes)
+  eq('复验返回 302 到 IdP', reauthRes.status, 302, String(reauthRes.status))
+  const authUrl = new URL(reauthRes.headers.location)
+  const state = authUrl.searchParams.get('state')
+  const stCookie = getCookie(reauthRes, 'dsh_wua_oidc_state') || state
+
+  // ② 走完 IdP，回调应带 oidcreauth
+  idpState.sub = 'sub-alice'
+  const authRes = await fetch(authUrl.href, { redirect: 'manual' })
+  const back = new URL(authRes.headers.get('location'))
+  const cb = makeRes()
+  await routes.get('/dsh-webui-oauth/oidc/callback').handler(
+    makeReq('/dsh-webui-oauth/oidc/callback?' + back.searchParams.toString(),
+      { cookie: 'dsh_wua_oidc_state=' + stCookie }), cb)
+  eq('复验回调 302 回应用', cb.status, 302, String(cb.status))
+  const loc = String(cb.headers.location || '')
+  const token = new URL(loc, 'http://x').searchParams.get('oidcreauth')
+  eq('回执带一次性复验令牌', !!token, loc)
+
+  // ③ 用令牌保存配置（current 留空）
+  const saved = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST',
+    headers: { 'content-type': 'application/json', ...H },
+    body: JSON.stringify({
+      username: 'admin', current: '', reauthToken: token, ttl: 12,
+      oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+    }),
+  })
+  eq('用复验令牌保存成功（无需密码）', saved.json && saved.json.ok === true, saved.res.body)
+  eq('保存后绑定仍在', JSON.parse(credsText || '{}').boundSub, 'sub-alice')
+
+  // ④ 令牌一次性：再用一次应回落到密码校验并失败
+  const replay = await call('/dsh-webui-oauth/configure', {
+    url: '/dsh-webui-oauth/configure', method: 'POST',
+    headers: { 'content-type': 'application/json', ...H },
+    body: JSON.stringify({
+      username: 'admin', current: '', reauthToken: token, ttl: 12,
+      oidc: { enabled: true, issuer: ISSUER, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectBase: 'https://webui.example.com', trustBrowserOrigin: false },
+    }),
+  })
+  eq('复验令牌不可重放', replay.json && replay.json.error, 'current-invalid')
+}
+
 console.log('\n— 6. 解绑：密码错误被拒，正确则清空并立即失效 —')
 {
   const bad = await call('/dsh-webui-oauth/oidc/unbind', {
@@ -616,6 +672,28 @@ console.log('\n— 9. 「仅允许 SSO」：未绑定拒绝启用 / 已绑定后
     body: JSON.stringify({ username: 'admin', password: 'pw12345678' }),
   })
   eq('关闭后密码登录恢复', pw2.json && pw2.json.ok === true, pw2.res.body)
+}
+
+console.log('\n— 10. 远程信任开关端点 —')
+{
+  const session = await loginLocal()
+  const H = { 'content-type': 'application/json', cookie: 'dsh_wua_session=' + session }
+
+  const anon = await call('/dsh-webui-oauth/remote-trust', {
+    method: 'POST', body: JSON.stringify({ enabled: true }),
+  })
+  eq('未登录时拒绝开关', anon.status, 401, String(anon.status))
+
+  const bad = await call('/dsh-webui-oauth/remote-trust', {
+    method: 'POST', headers: H, body: JSON.stringify({ enabled: 'yes' }),
+  })
+  eq('类型错误被拒', bad.json && bad.json.error, 'invalid')
+
+  // 测试桩的 webServer 没有 tapIndex：应明确降级，而不是假装成功
+  const r = await call('/dsh-webui-oauth/remote-trust', {
+    method: 'POST', headers: H, body: JSON.stringify({ enabled: true }),
+  })
+  eq('tapIndex 缺失时明确报错', r.json && r.json.error, 'tap-index-unavailable')
 }
 
 globalThis.fetch = realFetch

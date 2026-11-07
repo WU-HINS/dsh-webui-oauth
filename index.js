@@ -474,11 +474,33 @@ async function readOidcConfig(ctx, creds) {
   return { oidc: null, legacy: false }
 }
 
-/** 写入 OIDC 配置（独立文件，0600 由数据目录权限兜底）。 */
-async function writeOidcConfig(ctx, oidc) {
+/**
+ * 读取插件配置文件的**全部**顶层字段（不止 oidc）。
+ * 用于在不破坏其它配置的前提下写入 remoteTrust 等新字段。
+ */
+async function readPluginConfigFile(ctx) {
+  try {
+    const raw = await ctx.fs.readText(await ctx.fs.resolve(oidcConfigPath()))
+    const parsed = raw ? JSON.parse(raw) : null
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (e) {
+    return {}
+  }
+}
+
+/** 合并写入插件配置文件的顶层字段，保留未提及的键。 */
+async function writePluginConfigFile(ctx, patch) {
   ensureDataDir()
+  const current = await readPluginConfigFile(ctx)
+  const next = { ...current, ...patch }
   const target = await ctx.fs.resolve(oidcConfigPath())
-  await ctx.fs.writeText(target, JSON.stringify({ v: 1, oidc }), undefined, undefined, { mode: 'danger-full-access' })
+  await ctx.fs.writeText(target, JSON.stringify(next), undefined, undefined, { mode: 'danger-full-access' })
+  return next
+}
+
+/** 写入 OIDC 配置（独立文件，0600 由数据目录权限兜底）。保留其它顶层字段。 */
+async function writeOidcConfig(ctx, oidc) {
+  await writePluginConfigFile(ctx, { v: 1, oidc })
 }
 
 /** 从凭据对象里剥离历史遗留的 oidc 段（迁移到独立文件后不再重复保存）。 */
@@ -1104,7 +1126,9 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oidc/unbind',
   '/dsh-webui-oauth/oidc/callback',
   '/dsh-webui-oauth/oidc/logout',
+  '/dsh-webui-oauth/oidc/reauth',
   '/dsh-webui-oauth/oauth-relay',
+  '/dsh-webui-oauth/remote-trust',
 ])
 
 /**
@@ -1305,19 +1329,25 @@ export function remoteTrustEnabled(ctx) {
  *
  * @returns {boolean} 是否已安装
  */
-export function installRemoteTrust(ctx) {
-  if (!remoteTrustEnabled(ctx)) return false
+export function applyRemoteTrust(ctx, enabled) {
+  if (!enabled) return { ok: true, off: null }
   const ws = ctx && ctx.webServer
   if (!ws || typeof ws.tapIndex !== 'function') {
-    try { ctx.logger.warn('[dsh-webui-oauth] remote-web-ui.trustRemoteHost 已启用，但 webServer.tapIndex 不可用；未注入 ownsHost') } catch (e) { /* ignore */ }
-    return false
+    try { ctx.logger.warn('[dsh-webui-oauth] 远程访问信任已启用，但 webServer.tapIndex 不可用；未注入 ownsHost') } catch (e) { /* ignore */ }
+    return { ok: false, off: null }
   }
   const off = ws.tapIndex(injectRemoteTrust)
   try {
     if (typeof ctx.effect === 'function') ctx.effect(() => off, 'dsh-webui-oauth: remote trust index tap')
   } catch (e) { /* ignore */ }
   try { ctx.logger.info('[dsh-webui-oauth] remote trust index tap registered (__DSH_TRANSPORT__.ownsHost = true)') } catch (e) { /* ignore */ }
-  return true
+  return { ok: true, off }
+}
+
+/** 兼容旧调用：按 settings 配置安装一次。 */
+export function installRemoteTrust(ctx) {
+  if (!remoteTrustEnabled(ctx)) return false
+  return applyRemoteTrust(ctx, true).ok
 }
 
 /** 该请求是否是一次浏览器导航（而不是 fetch/XHR 的接口调用）。 */
@@ -2741,7 +2771,30 @@ export async function apply(ctx) {
   refreshSsoOnly().catch(() => {})
 
   // 远程访问信任（可选）：反代域名下让设置页可用。默认关闭；tapIndex 缺失时安全降级。
-  installRemoteTrust(ctx)
+  // 配置来源：插件配置 remoteTrust（设置页按钮写入），其次 settings 的
+  // remote-web-ui.trustRemoteHost（兼容手工配置）。
+  let remoteTrustOff = null
+  let remoteTrustFlag = false
+  const setRemoteTrustEnabled = (enabled) => {
+    if (!enabled) {
+      if (remoteTrustOff) { try { remoteTrustOff() } catch (e) { /* ignore */ } remoteTrustOff = null }
+      remoteTrustFlag = false
+      return true
+    }
+    if (remoteTrustOff) { remoteTrustFlag = true; return true }
+    const applied = applyRemoteTrust(ctx, true)
+    if (applied.ok) {
+      remoteTrustOff = applied.off
+      remoteTrustFlag = true
+      return true
+    }
+    remoteTrustFlag = false
+    return false
+  }
+  readPluginConfigFile(ctx).then((cfg) => {
+    const enabled = cfg.remoteTrust === true || remoteTrustEnabled(ctx)
+    setRemoteTrustEnabled(enabled)
+  }).catch(() => {})
 
   // 官方 DeepSeek 账号登录：把 callbackOrigin 桥接到回环地址（远程部署由中继端点完成）。
   installAccountLoginBridge(ctx)
@@ -2778,12 +2831,31 @@ export async function apply(ctx) {
   // 授权请求状态表（TTL + 容量上限），见 makeOidcStateStore 的说明。
   // 必须在后台定时器使用 purge 之前定义。
   const oidcStateStore = makeOidcStateStore()
+
+  // 敏感操作（保存配置 / 禁用 / 解绑）的 SSO 复验令牌：
+  // 一次性、2 分钟。密码被禁用（仅允许 SSO）时，用户仍可用 SSO 完成二次验证。
+  const reauthTokens = new Map()
+  const REAUTH_TTL_MS = 2 * 60 * 1000
+  const mintReauthToken = (username) => {
+    const token = randomBytes(16).toString('hex')
+    reauthTokens.set(token, { username, expiresAt: Date.now() + REAUTH_TTL_MS })
+    return token
+  }
+  const consumeReauthToken = (token) => {
+    if (typeof token !== 'string' || !token) return null
+    const rec = reauthTokens.get(token)
+    if (!rec) return null
+    reauthTokens.delete(token)
+    if (rec.expiresAt <= Date.now()) return null
+    return rec
+  }
   const purgeExpiredOidcStates = oidcStateStore.purge
 
   // 后台任务：过期会话清理 + enabled 状态刷新
   const bgTimer = setInterval(async () => {
     const now = Date.now()
     for (const [k, s] of sessions.live) if (s.expiresAt <= now) sessions.delete(k)
+    for (const [k, v] of reauthTokens) if (v.expiresAt <= now) reauthTokens.delete(k)
     purgeExpiredOidcStates()
     try {
       const creds = await readCredentials(ctx)
@@ -3050,8 +3122,8 @@ export async function apply(ctx) {
           username: enabled ? creds.username : null,
           ttl: ttlOf(creds),
           sessionsPersisted: sessions.ok,
-          // 远程访问信任（可选）：是否按 remote-web-ui.trustRemoteHost 注入了 ownsHost。
-          remoteTrust: remoteTrustEnabled(ctx),
+          // 远程访问信任（可选）：是否已注入 ownsHost。
+          remoteTrust: remoteTrustFlag,
           // 核心兜底席位形态（handler | resource | absent | unknown）：核心升级后
           // 如果这里变成 unknown，文档请求会 404 —— 排查时先看这个字段。
           fallback: fallbackShape(ctx.webServer),
@@ -3171,7 +3243,9 @@ export async function apply(ctx) {
           }
         }
         if (wasEnabled) {
-          const curValid = current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+          // 支持 SSO 复验令牌（「仅允许 SSO」时密码登录入口不可用）
+          const reauthOk = !!consumeReauthToken(body.reauthToken)
+          const curValid = reauthOk || (current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
           if (!curValid) {
             await auditLog(ctx, 'configure_failure', { username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
             sendJson(res, 200, { ok: false, error: 'current-invalid' })
@@ -3338,7 +3412,8 @@ export async function apply(ctx) {
           sendJson(res, 200, { ok: true })
           return
         }
-        const curValid = current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+        const reauthOk = !!consumeReauthToken(body.reauthToken)
+        const curValid = reauthOk || (current && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
         if (!curValid) {
           await auditLog(ctx, 'disable_failure', { username: creds.username, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
           sendJson(res, 200, { ok: false, error: 'current-invalid' })
@@ -3474,6 +3549,39 @@ export async function apply(ctx) {
     },
   }), 'dsh-webui-oauth: oidc login')
 
+  // OIDC 复验：GET /dsh-webui-oauth/oidc/reauth
+  //
+  // 用于「保存认证配置 / 禁用认证 / 解绑」前的二次验证。要求已登录会话；
+  // 走一次 IdP 授权后，回调只签发一次性复验令牌（2 分钟），不新建会话。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/oidc/reauth',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          sendJson(res, 405, { error: '仅支持 GET' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const creds0 = await readCredentials(ctx)
+        if (!(await oidcEnabled(creds0))) {
+          sendJson(res, 200, { ok: false, error: 'oidc-not-configured' })
+          return
+        }
+        if (!isOidcBound(creds0)) {
+          sendJson(res, 200, { ok: false, error: 'oidc-not-bound' })
+          return
+        }
+        await startOidcAuthorize(ctx, req, res, 'reauth')
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: oidc reauth')
+
   // 发起 OIDC 绑定授权：GET /dsh-webui-oauth/oidc/bind
   //
   // 必须先持有有效的本地会话（已登录）——绑定语义是"把我这个管理员账号
@@ -3521,7 +3629,8 @@ export async function apply(ctx) {
         const creds = await readCredentials(ctx)
         const meta = requestMeta(req)
         const current = String(body.current || '')
-        const curValid = current && creds && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash)
+        const reauthOk = !!consumeReauthToken(body.reauthToken)
+        const curValid = reauthOk || (current && creds && typeof creds.hash === 'string' && await verifyPassword(current, creds.hash))
         if (!curValid) {
           await auditLog(ctx, 'oidc_unbind_failure', { username: creds && creds.username ? creds.username : null, ip: meta.ip, ua: meta.ua, detail: '当前密码不正确' })
           sendJson(res, 200, { ok: false, error: 'current-invalid' })
@@ -3671,6 +3780,25 @@ export async function apply(ctx) {
 
         // 用途分支：绑定 vs 登录。purpose 来自服务端 state 表（见 startOidcAuthorize），
         // 浏览器无法通过改 URL 把绑定流程降级成登录流程。
+        // SSO 复验：用于保存配置/禁用/解绑的二次验证，不新建会话。
+        if (st.purpose === 'reauth') {
+          const bound = boundSubOf(creds)
+          if (!bound) {
+            await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: '复验时尚未绑定身份' })
+            redirectBackToApp(ctx, req, res, 'oidcerr=not-bound', clearStateCookie)
+            return
+          }
+          if (!safeTokenEquals(String(rawSub), bound)) {
+            await auditLog(ctx, 'oidc_login_failure', { username: auditName, ip: meta.ip, ua: meta.ua, detail: '复验身份不匹配' })
+            redirectBackToApp(ctx, req, res, 'oidcerr=sub-mismatch', clearStateCookie)
+            return
+          }
+          const token = mintReauthToken(rawSub)
+          await auditLog(ctx, 'oidc_reauth_success', { username: auditName, ip: meta.ip, ua: meta.ua })
+          redirectBackToApp(ctx, req, res, 'oidcreauth=' + token, clearStateCookie)
+          return
+        }
+
         if (st.purpose === 'bind') {
           // 绑定：把本次校验通过的 sub 记进凭据文件。
           // 保留原有 username/hash/ttl，只加 boundSub —— 用 spread 以免漏字段。
@@ -3746,6 +3874,50 @@ export async function apply(ctx) {
       }
     },
   }), 'dsh-webui-oauth: oidc logout')
+
+  // 远程访问信任开关：POST /dsh-webui-oauth/remote-trust
+  //
+  // 设置页按钮调用。写插件配置（不碰核心 settings），并动态安装/移除 index tap。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/remote-trust',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (!checkRequest(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        if (typeof body.enabled !== 'boolean') {
+          sendJson(res, 200, { ok: false, error: 'invalid', reason: 'enabled 须为 boolean' })
+          return
+        }
+        await writePluginConfigFile(ctx, { remoteTrust: body.enabled })
+        const applied = setRemoteTrustEnabled(body.enabled)
+        if (!applied) {
+          sendJson(res, 200, {
+            ok: false,
+            error: 'tap-index-unavailable',
+            reason: '当前核心不支持 webServer.tapIndex，无法注入 ownsHost',
+          })
+          return
+        }
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'remote_trust', {
+          username: null, ip: meta.ip, ua: meta.ua,
+          detail: body.enabled ? '已开启远程访问信任' : '已关闭远程访问信任',
+        })
+        sendJson(res, 200, { ok: true, enabled: remoteTrustFlag })
+      } catch (e) {
+        sendJson(res, 500, { error: 'remote-trust-failed' })
+      }
+    },
+  }), 'dsh-webui-oauth: remote trust toggle')
 
   // 官方 DeepSeek 登录的「回调中转」：POST /dsh-webui-oauth/oauth-relay
   //

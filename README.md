@@ -121,11 +121,12 @@ DSH WebUI 身份认证插件（持久化插件）。在「设置 → 身份认�
 
 
 - **远程访问信任（0.7.3，原 `dsh-remote-trust` 的可选内置）**：经域名反代访问时，客户端会把页面判为"非 loopback"，设置 → 模型会报 `settings are unavailable in this browser`。开启下面这一项即可（等价于安装 `dsh-remote-trust`，但不需要额外插件）：
+  **0.7.5 起也可以直接在设置页点「开启远程访问信任」**，无需改 YAML；手工配置仍然兼容：
   ```yaml
   remote-web-ui:
     trustRemoteHost: true
   ```
-  它通过官方 `webServer.tapIndex` 往 index.html 注入 `__DSH_TRANSPORT__.ownsHost = true`；注入幂等，与 `dsh-remote-trust` 同时安装也不会重复。`tapIndex` 不存在时只记一条 warn，插件其余功能照常（版本兼容）。
+  它通过官方 `webServer.tapIndex` 往 index.html 注入 `__DSH_TRANSPORT__.ownsHost = true`；注入幂等，与 `dsh-remote-trust` 同时安装也不会重复。设置页开关写入插件配置 `dsh-webui-oauth.json` 的 `remoteTrust`，动态生效（刷新页面后 index 生效）。`tapIndex` 不存在时只记一条 warn，插件其余功能照常（版本兼容）。
   **安全边界**：该声明会把页面当作"可信本机"，同时放开其他以 `isLoopback` 为条件的本机专属客户端表面；只应在页面已由本插件保护时启用，且服务端仍需 `--trusted-host <对外域名>`（它不改变服务端信任护栏）。
 - **追加公开路径（0.6.7，默认拒绝的配套开关）**：机器调用、无法携带浏览器会话的端点（GitHub webhook、第三方 OAuth 回跳等）必须显式声明，否则会被闸门 401。同一 settings 段：
   ```yaml
@@ -422,7 +423,7 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 - **DeepSeek 官方账号登录（0.2.1+，远程回调中转）**：`/oauth/callback` **不是公开路径**，仍受会话闸门保护。上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` 只接受 `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），不支持反代域名。插件的处理方式：
   - 劫持官方登录的 `callbackOrigin`：本地回环访问保留原 origin（cookie 同 host，回调直接命中）；域名访问改写成 `http://127.0.0.1:<本机端口>`；
   - 浏览器授权后会被跳到这个回环回调地址——远程机器上通常打不开，但地址栏里有完整 URL；
-  - 设置 → 身份认证 → 远程访问 →「打开回调中转窗口」，把地址栏 URL 粘贴进去；插件在服务端**内部重放**给账号平台注册的 `/oauth/callback` handler（state + PKCE 仍由平台校验），完成换 token；
+  - 点击页面右下角常驻的「DeepSeek 登录回调」悬浮按钮，把地址栏 URL 粘贴进去；插件在服务端**内部重放**给账号平台注册的 `/oauth/callback` handler（state + PKCE 仍由平台校验），完成换 token；
   - 中转端点要求插件会话，且只接受本机端口的 `/oauth/callback` + 单个 `code`/`state`（防 SSRF / 开放重定向）；
   - 本机 `http://127.0.0.1:3080` 访问时官方登录原本就能直接走完，无需中转。
 - **DSH Desktop**：支持 `dsh-desktop-*` 标记透传（登录 / 退出后重登不再丢失标记），但**不提供**上游 0.3.6 的「宿主载体桥」。该桥只用 socket 是否回环来判定，而本部署是 nginx 同机反代——所有请求的 socket 都是 `127.0.0.1`，启用它等于"持有核心 Cookie 即可绕过插件会话 / SSO"，与「仅允许 SSO」冲突。若必须使用 DSH Desktop 的 shell 直连模式，请改用上游原版插件，并自行评估该旁路风险。

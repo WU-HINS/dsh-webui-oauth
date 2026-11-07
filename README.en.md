@@ -112,13 +112,16 @@ Authentication is enforced in four layers, all implemented by **wrapping the web
 - **Remote-access trust (0.7.3, optional built-in equivalent of `dsh-remote-trust`)**: when the page is
   reached through a domain reverse proxy, the client treats it as non-loopback and Settings → Models
   reports `settings are unavailable in this browser`. Enable:
+  **Since 0.7.5 you can simply click "开启远程访问信任" on the settings page**; editing YAML is no longer
+  required (and is still supported):
   ```yaml
   remote-web-ui:
     trustRemoteHost: true
   ```
   It injects `__DSH_TRANSPORT__.ownsHost = true` into index.html through the official
   `webServer.tapIndex`; the injection is idempotent, so installing `dsh-remote-trust` as well does not
-  duplicate it. If `tapIndex` is unavailable it only logs a warning and everything else keeps working
+  duplicate it. The settings toggle writes `remoteTrust` into `dsh-webui-oauth.json` and applies
+  dynamically (refresh the page for the injected index to take effect). If `tapIndex` is unavailable it only logs a warning and everything else keeps working
   (version compatibility).
   **Security boundary**: the declaration marks the page as a "trusted local" surface and also opens
   other client-side features gated on `isLoopback`; enable it only when the page is already protected
@@ -426,9 +429,10 @@ wired into `npm test`).
     `http://127.0.0.1:<local port>`;
   - after authorization the browser is redirected to that loopback callback — usually unreachable from
     a remote machine, but the full URL stays in the address bar;
-  - Settings → Authentication → Remote access → "Open callback relay window", paste the URL; the plugin
-    **replays it internally** to the account platform's registered `/oauth/callback` handler (state and
-    PKCE are still validated by the platform) to finish the token exchange;
+  - click the always-on "DeepSeek 登录回调" floating button at the bottom-right of any page and paste
+    the URL; the plugin **replays it internally** to the account platform's registered
+    `/oauth/callback` handler (state and PKCE are still validated by the platform) to finish the
+    token exchange;
   - the relay endpoint requires the plugin session and accepts only the local port's
     `/oauth/callback` with exactly one `code`/`state` (SSRF / open-redirect protection);
   - on `http://127.0.0.1:3080` the official login already completes directly; no relay needed.
