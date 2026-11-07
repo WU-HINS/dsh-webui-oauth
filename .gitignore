@@ -6,6 +6,7 @@ audit.jsonl
 
 # 会话令牌、审计 HMAC 密钥、setup token——切勿提交
 sessions.jsonl
+devices.jsonl
 audit-hmac-key
 setup-token
 

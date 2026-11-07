@@ -2,6 +2,51 @@
 
 本文件记录每个版本的**用户可见**变更。破坏性变更与升级动作单独标注。
 
+## 0.8.0
+
+新增 **OAuth 2.1 设备授权（RFC 8628，无回调）**：App / CLI 可以获得与浏览器完全独立的设备会话，
+只有主动吊销才失效。
+
+### 新增：设备授权流程
+
+- `POST /dsh-webui-oauth/device/authorize`（公开）→ `device_code`、`user_code`、
+  `verification_uri`、`verification_uri_complete`、`expires_in`、`interval`；
+- `GET /dsh-webui-oauth/device`（公开）→ 批准页；输入代码后批准/拒绝；
+- `POST /dsh-webui-oauth/device/approve`（**仅浏览器会话**）→ 批准或拒绝；
+- `POST /dsh-webui-oauth/device/token`（公开）→ 轮询换 `access_token`；
+  支持 `authorization_pending` / `slow_down` / `access_denied` / `expired_token` / `invalid_grant`。
+
+### 新增：独立设备会话
+
+- 设备 token 存放在 `devices.jsonl`，**只存 SHA-256**，比对用 `timingSafeEqual`；
+- 无过期时间，只有 `POST /dsh-webui-oauth/devices/revoke` 主动吊销才失效；
+- `checkRequest` 接受 `Authorization: Bearer`，覆盖 `/api`、`/plugins`、
+  WebSocket upgrade、静态资源与 fallback；
+- 设置页新增「设备会话（App / CLI）」卡片：名称、创建/最近使用时间、逐个吊销、刷新；
+- 设备 Bearer **不能**做设备管理（列表 / 吊销 / 批准新设备只允许浏览器会话），
+  避免一个被窃取的设备 token 反向吊销其它设备或自我扩权。
+
+### 新增：核心 launch Cookie 桥
+
+- `POST /dsh-webui-oauth/device/core-session`（仅设备 Bearer）：
+  服务端内部用 `connection.authenticatedUrl()` + `Host: <authority>` 调本机，
+  截获 `dsh-auth-*` Cookie，返回 `{cookie_name, cookie_value, authority}`；
+- **不把 launch token 交给客户端**（它等价于该进程 owner 权限）；
+- 响应 `no-store`。
+
+### 安全边界
+
+- 设备授权是公开端点：待批准队列上限 1000、设备码 10 分钟过期、轮询最小间隔 5 秒；
+- 设备 token = 该 dsh 的完整权限；建议只保存在可信设备，丢失后立即吊销；
+- 设备管理只允许浏览器会话（Cookie），Bearer 会被 401。
+
+### 测试
+
+- 新增 `test/device-flow.test.mjs`（27 项）：authorize → pending → 批准 → token →
+  Bearer 访问 → 设备列表 → 核心 Cookie 桥 → 主动吊销 → 401；磁盘只存哈希、
+  device_code 不可重放、设备 Bearer 不能做设备管理；
+- 全量 24 个测试文件、656 项断言通过。
+
 ## 0.7.9
 
 「概览」卡片新增**「吊销所有浏览器会话」**按钮。

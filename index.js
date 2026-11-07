@@ -153,6 +153,7 @@
  */
 
 import { randomBytes, scrypt as scryptCb, timingSafeEqual, createHmac, createHash, createPublicKey, verify as cryptoVerify } from "node:crypto";
+import { request as httpRequest } from "node:http";
 import { readFileSync, writeFileSync, appendFileSync, accessSync, mkdirSync, unlinkSync, constants as fsConstants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve as resolvePath } from "node:path";
@@ -370,6 +371,11 @@ function oidcConfigPath() {
 /** H3: 会话持久化文件（JSONL，一行一个会话）。 */
 function sessionsPath() {
   return DATA_DIR + '/sessions.jsonl'
+}
+
+/** 设备会话（App / CLI）持久化文件：只存 token 的 SHA-256，永不存明文。 */
+function devicesPath() {
+  return DATA_DIR + '/devices.jsonl'
 }
 
 /** H5: HMAC 密钥文件，用于审计 IP 的假名化。 */
@@ -741,6 +747,14 @@ function cookieOf(req, name) {
   return null
 }
 
+/** 从 Authorization: Bearer 取设备令牌；格式不合法时返回 null。 */
+function bearerOf(req) {
+  const raw = req && req.headers ? req.headers.authorization : null
+  if (!raw) return null
+  const m = /^Bearer\s+([A-Za-z0-9._~+\/=-]+)$/i.exec(String(raw).trim())
+  return m ? m[1] : null
+}
+
 /**
  * 恒定时间令牌比较：先对两侧做 HMAC-SHA256 归一化（消除长度侧信道），
  * 再 timingSafeEqual。用于 setup token 校验（128-bit 随机值，网络时序本难利用，
@@ -851,6 +865,221 @@ class PersistentSessions {
     this.live.clear()
     this.append({ op: 'clear', token: '*' })
   }
+}
+
+/**
+ * 设备会话存储（App / CLI 的 Bearer 凭据）。
+ *
+ * 与浏览器会话**完全独立**：
+ *   - 不绑 Cookie、不随浏览器退出/会话 TTL 失效；
+ *   - 没有过期时间，只有显式吊销（revoke）才失效；
+ *   - 只存 token 的 SHA-256，比对用 timingSafeEqual；
+ *   - 单独一份 devices.jsonl，设置页单独一个列表。
+ */
+class PersistentDevices {
+  constructor() {
+    this.live = new Map()
+    this.ok = true
+  }
+
+  load() {
+    let lines = []
+    try {
+      lines = readFileSync(devicesPath(), 'utf8').split('\n').filter((l) => l.trim())
+    } catch (e) { return }
+    for (const line of lines) {
+      let ev = null
+      try { ev = JSON.parse(line) } catch (e) { continue }
+      if (!ev || typeof ev.op !== 'string') continue
+      if (ev.op === 'add' && ev.dev && typeof ev.dev === 'object' && typeof ev.dev.id === 'string') {
+        this.live.set(ev.dev.id, { ...ev.dev })
+      } else if (ev.op === 'revoke' && typeof ev.id === 'string') {
+        const d = this.live.get(ev.id)
+        if (d) d.revokedAt = Number(ev.at) || Date.now()
+      } else if (ev.op === 'touch' && typeof ev.id === 'string') {
+        const d = this.live.get(ev.id)
+        if (d) d.lastUsedAt = Number(ev.at) || 0
+      }
+    }
+  }
+
+  append(ev) {
+    try {
+      ensureDataDir()
+      appendFileSync(devicesPath(), JSON.stringify(ev) + '\n', { encoding: 'utf8', mode: 0o600 })
+      this.ok = true
+    } catch (e) {
+      this.ok = false
+    }
+  }
+
+  compact() {
+    try {
+      ensureDataDir()
+      const out = []
+      for (const dev of this.live.values()) out.push({ op: 'add', dev })
+      for (const dev of this.live.values()) {
+        if (dev.revokedAt) out.push({ op: 'revoke', id: dev.id, at: dev.revokedAt })
+      }
+      writeFileSync(devicesPath(), out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : ''), { encoding: 'utf8', mode: 0o600 })
+    } catch (e) { /* 压缩失败不影响运行 */ }
+  }
+
+  add({ name, hash, clientId, scope }) {
+    const id = randomBytes(8).toString('hex')
+    const now = Date.now()
+    const rec = {
+      id,
+      name: String(name || '设备').slice(0, 60),
+      hash,
+      clientId: String(clientId || ''),
+      scope: String(scope || 'dsh'),
+      createdAt: now,
+      lastUsedAt: 0,
+    }
+    this.live.set(id, rec)
+    this.append({ op: 'add', dev: rec })
+    return rec
+  }
+
+  /** 恒定时间查 token：遍历所有未吊销设备，比较 SHA-256。 */
+  findByToken(token) {
+    if (typeof token !== 'string' || token.length === 0) return null
+    const hb = Buffer.from(createHash('sha256').update(token).digest('hex'), 'hex')
+    for (const dev of this.live.values()) {
+      if (dev.revokedAt) continue
+      let db
+      try { db = Buffer.from(String(dev.hash || ''), 'hex') } catch (e) { continue }
+      if (db.length === hb.length && timingSafeEqual(db, hb)) return dev
+    }
+    return null
+  }
+
+  touch(dev) {
+    const now = Date.now()
+    dev.lastUsedAt = now
+    // 每次请求都写盘会放大 IO：最多每分钟落一次 touch
+    if (now - (dev.persistedAt || 0) >= 60000) {
+      dev.persistedAt = now
+      this.append({ op: 'touch', id: dev.id, at: now })
+    }
+  }
+
+  revoke(id) {
+    const dev = this.live.get(id)
+    if (!dev || dev.revokedAt) return false
+    dev.revokedAt = Date.now()
+    this.append({ op: 'revoke', id, at: dev.revokedAt })
+    return true
+  }
+
+  list() {
+    const out = []
+    for (const dev of this.live.values()) {
+      if (dev.revokedAt) continue
+      out.push({
+        id: dev.id,
+        name: dev.name,
+        clientId: dev.clientId,
+        scope: dev.scope,
+        createdAt: dev.createdAt,
+        lastUsedAt: dev.lastUsedAt,
+      })
+    }
+    out.sort((a, b) => b.createdAt - a.createdAt)
+    return out
+  }
+
+  count() {
+    let n = 0
+    for (const dev of this.live.values()) if (!dev.revokedAt) n += 1
+    return n
+  }
+}
+
+/**
+ * 设备授权批准页（RFC 8628 的 verification_uri）。
+ * 公开 GET；真正的批准 POST 需要浏览器会话（自管端点里 checkRequest）。
+ * 只回填 A-Z0-9- 的 user_code，避免把 query 原样注入 HTML。
+ */
+function deviceApprovalPage(userCode) {
+  const code = String(userCode || '').toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 9)
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>设备授权 · DSH</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #f6f7f9; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #15171b; }
+  @media (prefers-color-scheme: dark) { body { background: #141416; color: #f2f3f5; } }
+  .card { width: 380px; max-width: calc(100vw - 40px); padding: 26px 24px; box-sizing: border-box;
+    background: #fff; border: 1px solid rgba(0,0,0,.08); border-radius: 14px;
+    box-shadow: 0 18px 50px rgba(0,0,0,.10); }
+  @media (prefers-color-scheme: dark) { .card { background: #1e1e21; border-color: rgba(255,255,255,.10); box-shadow: 0 18px 50px rgba(0,0,0,.5); } }
+  h1 { margin: 0 0 6px; font-size: 18px; }
+  p.sub { margin: 0 0 18px; font-size: 13px; line-height: 1.65; opacity: .68; }
+  label { display: block; font-size: 12px; opacity: .65; margin-bottom: 6px; }
+  input { box-sizing: border-box; width: 100%; height: 42px; padding: 0 12px; font-size: 17px; letter-spacing: .18em;
+    text-align: center; text-transform: uppercase; border-radius: 10px; border: 1px solid rgba(0,0,0,.18);
+    background: transparent; color: inherit; outline: none; }
+  input:focus { border-color: #4a7cf7; box-shadow: 0 0 0 3px rgba(74,124,247,.18); }
+  .row { display: flex; gap: 10px; margin-top: 16px; }
+  button { flex: 1; height: 40px; font-size: 13px; font-weight: 600; border-radius: 10px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,.15); background: transparent; color: inherit; }
+  button.primary { background: #4a7cf7; border-color: #4a7cf7; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #m { margin: 14px 0 0; font-size: 13px; line-height: 1.6; min-height: 20px; }
+  a { color: #4a7cf7; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>设备授权</h1>
+  <p class="sub">输入应用显示的代码。批准后，该设备会获得一个与浏览器独立的会话，只有主动吊销才会失效。</p>
+  <label for="c">设备代码</label>
+  <input id="c" value="${code}" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX">
+  <div class="row">
+    <button id="no">拒绝</button>
+    <button id="ok" class="primary">批准</button>
+  </div>
+  <p id="m"></p>
+</div>
+<script>
+(function () {
+  var m = document.getElementById('m');
+  var ok = document.getElementById('ok');
+  var no = document.getElementById('no');
+  async function act(decision) {
+    ok.disabled = true; no.disabled = true;
+    m.textContent = '处理中…';
+    try {
+      var res = await fetch('/dsh-webui-oauth/device/approve', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ user_code: document.getElementById('c').value, action: decision })
+      });
+      if (res.status === 401) {
+        m.innerHTML = '请先登录后再批准。<a href="/dsh-webui-oauth/login">前往登录</a>';
+        return;
+      }
+      var j = await res.json();
+      if (j && j.ok) m.textContent = decision === 'approve' ? '已批准，请返回应用完成登录。' : '已拒绝该设备。';
+      else m.textContent = (j && (j.reason || j.error)) || '操作失败';
+    } catch (e) {
+      m.textContent = '无法连接认证服务';
+    } finally {
+      ok.disabled = false; no.disabled = false;
+    }
+  }
+  ok.addEventListener('click', function () { act('approve'); });
+  no.addEventListener('click', function () { act('deny'); });
+})();
+</script>
+</body>
+</html>`
 }
 
 // ---------------- 登录页（与上游一致，追加 setup-token 输入框） ----------------
@@ -1107,6 +1336,9 @@ const PUBLIC_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/setup',        // 首次初始化（由 setup token 把关）
   '/dsh-webui-oauth/oidc/login',   // SSO 发起（未绑定时内部拒绝）
   '/dsh-webui-oauth/oidc/callback',// IdP 回跳（state + PKCE + 验签把关）
+  '/dsh-webui-oauth/device',            // 设备授权批准页（GET；批准 POST 走自管端点）
+  '/dsh-webui-oauth/device/authorize',  // RFC 8628 设备授权请求
+  '/dsh-webui-oauth/device/token',      // RFC 8628 轮询换 token
 ])
 
 // 本插件自己注册的端点：内部**逐个**自带 checkRequest（公开的那几个按设计放行）。
@@ -1130,6 +1362,10 @@ const SELF_GATED_EXACT_PATHS = new Set([
   '/dsh-webui-oauth/oauth-relay',
   '/dsh-webui-oauth/remote-trust',
   '/dsh-webui-oauth/sessions/revoke',
+  '/dsh-webui-oauth/device/approve',
+  '/dsh-webui-oauth/device/core-session',
+  '/dsh-webui-oauth/devices',
+  '/dsh-webui-oauth/devices/revoke',
 ])
 
 /**
@@ -2661,6 +2897,27 @@ export async function apply(ctx) {
   sessions.load()
   sessions.compact()
 
+  // 设备会话（App / CLI）：与浏览器会话独立，只有显式吊销才失效。
+  const devices = new PersistentDevices()
+  devices.load()
+  devices.compact()
+
+  // RFC 8628 待批准的设备码（内存态，10 分钟过期）。
+  const pendingDevices = new Map()
+  const DEVICE_CLIENT_ID = 'dsh-app'
+  const DEVICE_CODE_TTL_MS = 10 * 60 * 1000
+  const DEVICE_INTERVAL_S = 5
+  const USER_CODE_ALPHABET = 'BCDFGHJKLMNPQRSTVWXZ23456789'
+  function makeUserCode() {
+    const bytes = randomBytes(8)
+    let out = ''
+    for (let i = 0; i < 8; i += 1) out += USER_CODE_ALPHABET[bytes[i] % USER_CODE_ALPHABET.length]
+    return out.slice(0, 4) + '-' + out.slice(4)
+  }
+  function normalizeUserCode(raw) {
+    return String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+  }
+
   // H4: 按 IP 限流 { ip -> [timestamps] }
   const failuresByIp = new Map()
   const RATE_WINDOW_MS = 60_000
@@ -2692,6 +2949,16 @@ export async function apply(ctx) {
 
   function checkRequest(req) {
     if (!enabledFlag) return true
+    // 设备会话（App / CLI）：Bearer token，与浏览器 Cookie 完全独立。
+    // 显式携带了 Bearer 却无效时直接拒绝，不回落到 Cookie——避免"令牌坏了
+    // 却因为浏览器恰好带着 Cookie 而静默放行"。
+    const bearer = bearerOf(req)
+    if (bearer) {
+      const dev = devices.findByToken(bearer)
+      if (!dev) return false
+      devices.touch(dev)
+      return true
+    }
     const token = cookieOf(req, COOKIE_NAME)
     if (!token) return false
     const s = sessions.get(token)
@@ -3177,6 +3444,352 @@ export async function apply(ctx) {
     },
   }), 'dsh-webui-oauth: revoke sessions')
 
+  // ---------------- 设备授权（RFC 8628 device_code） ----------------
+  //
+  // 面向 App / CLI：无回调、无浏览器 Cookie。流程：
+  //   POST /device/authorize  → device_code + user_code + verification_uri
+  //   用户在浏览器打开 verification_uri 并批准（需浏览器会话）
+  //   POST /device/token      → 轮询换 Bearer access_token
+  //
+  // 换到的 token 存在 devices.jsonl（只存 SHA-256），与浏览器会话完全独立，
+  // 没有过期时间，只有显式吊销（/devices/revoke）才失效。
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device/authorize',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const clientId = String(body.client_id || '')
+        if (clientId !== DEVICE_CLIENT_ID) {
+          sendJson(res, 400, { error: 'invalid_client' })
+          return
+        }
+        // 防灌爆：先清过期，再限制待批准队列长度（公开端点，必须设上限）。
+        const now = Date.now()
+        for (const [k, p] of pendingDevices) if (p.expiresAt <= now) pendingDevices.delete(k)
+        if (pendingDevices.size >= 1000) {
+          sendJson(res, 429, { error: 'temporarily_unavailable' })
+          return
+        }
+        const deviceCode = randomBytes(32).toString('hex')
+        const userCode = makeUserCode()
+        const scope = String(body.scope || 'dsh').slice(0, 80)
+        const name = String(body.client_name || body.name || '').trim().slice(0, 60) || 'App'
+        pendingDevices.set(deviceCode, {
+          userCode,
+          clientId,
+          scope,
+          name,
+          expiresAt: now + DEVICE_CODE_TTL_MS,
+          interval: DEVICE_INTERVAL_S,
+          lastPollAt: 0,
+          approvedBy: null,
+          denied: false,
+          issued: false,
+        })
+        const origin = requestOriginOf(req) || ('http://127.0.0.1:' + (ctx.webServer.port || 3080))
+        const verify = origin + '/dsh-webui-oauth/device'
+        sendJson(res, 200, {
+          device_code: deviceCode,
+          user_code: userCode,
+          verification_uri: verify,
+          verification_uri_complete: verify + '?user_code=' + encodeURIComponent(userCode),
+          expires_in: Math.floor(DEVICE_CODE_TTL_MS / 1000),
+          interval: DEVICE_INTERVAL_S,
+        })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device authorize')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device/token',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const grant = String(body.grant_type || '')
+        if (grant !== 'urn:ietf:params:oauth:grant-type:device_code') {
+          sendJson(res, 400, { error: 'unsupported_grant_type' })
+          return
+        }
+        const code = String(body.device_code || '')
+        const pending = pendingDevices.get(code)
+        if (!pending) {
+          sendJson(res, 400, { error: 'invalid_grant' })
+          return
+        }
+        if (pending.expiresAt <= Date.now()) {
+          pendingDevices.delete(code)
+          sendJson(res, 400, { error: 'expired_token' })
+          return
+        }
+        if (pending.denied) {
+          pendingDevices.delete(code)
+          sendJson(res, 400, { error: 'access_denied' })
+          return
+        }
+        if (!pending.approvedBy) {
+          const now = Date.now()
+          if (pending.lastPollAt && now - pending.lastPollAt < pending.interval * 1000) {
+            pending.lastPollAt = now
+            sendJson(res, 400, { error: 'slow_down' })
+            return
+          }
+          pending.lastPollAt = now
+          sendJson(res, 400, { error: 'authorization_pending' })
+          return
+        }
+        // 单次发放：同一个 device_code 只能换一次 token。
+        const token = randomBytes(32).toString('hex')
+        const hash = createHash('sha256').update(token).digest('hex')
+        const rec = devices.add({ name: pending.name, hash, clientId: pending.clientId, scope: pending.scope })
+        pending.issued = true
+        pendingDevices.delete(code)
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'device_token_issued', { username: pending.approvedBy, ip: meta.ip, ua: meta.ua, detail: rec.name })
+        sendJson(res, 200, {
+          access_token: token,
+          token_type: 'Bearer',
+          scope: pending.scope,
+          device_id: rec.id,
+        })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device token')
+
+  // 批准页（公开 GET；POST 批准需要浏览器会话）
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device',
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        sendJson(res, 405, { error: '仅支持 GET' })
+        return
+      }
+      let code = ''
+      try {
+        code = new URL(req.url || '/', 'http://x').searchParams.get('user_code') || ''
+      } catch (e) { code = '' }
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'x-frame-options': 'DENY',
+      })
+      res.end(deviceApprovalPage(code))
+    },
+  }), 'dsh-webui-oauth: device page')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device/approve',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        // 只允许浏览器会话批准：设备 Bearer 不能给自己或其它设备发放新设备。
+        if (enabledFlag && !sessionOf(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const wanted = normalizeUserCode(body.user_code)
+        let entry = null
+        let code = null
+        for (const [dc, pending] of pendingDevices) {
+          if (pending.userCode.replace('-', '') === wanted) {
+            entry = pending
+            code = dc
+            break
+          }
+        }
+        if (!entry) {
+          sendJson(res, 200, { ok: false, error: 'invalid-code', reason: '设备代码不存在或已过期' })
+          return
+        }
+        if (entry.expiresAt <= Date.now()) {
+          pendingDevices.delete(code)
+          sendJson(res, 200, { ok: false, error: 'expired', reason: '设备代码已过期，请在应用中重新发起' })
+          return
+        }
+        if (body.action === 'deny') {
+          entry.denied = true
+          const meta = requestMeta(req)
+          await auditLog(ctx, 'device_denied', { username: null, ip: meta.ip, ua: meta.ua, detail: entry.name })
+          sendJson(res, 200, { ok: true, denied: true })
+          return
+        }
+        const sess = sessionOf(req)
+        entry.approvedBy = sess && sess.username ? sess.username : 'operator'
+        if (typeof body.name === 'string' && body.name.trim()) entry.name = body.name.trim().slice(0, 60)
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'device_approved', { username: entry.approvedBy, ip: meta.ip, ua: meta.ua, detail: entry.name })
+        sendJson(res, 200, { ok: true })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device approve')
+
+  // 设备会话列表 / 吊销（浏览器会话）
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/devices',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: '仅支持 GET' })
+        return
+      }
+      // 设备管理只开放给浏览器会话：设备 Bearer 不得列出/吊销其它设备。
+      if (enabledFlag && !sessionOf(req)) {
+        sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      sendJson(res, 200, { ok: true, devices: devices.list() })
+    },
+  }), 'dsh-webui-oauth: devices')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/devices/revoke',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        if (enabledFlag && !sessionOf(req)) {
+          sendJson(res, 401, { error: 'unauthorized' })
+          return
+        }
+        const body = await readJsonBody(req, res)
+        if (body === null) return
+        const id = String(body.id || '')
+        if (!devices.revoke(id)) {
+          sendJson(res, 200, { ok: false, error: 'not-found' })
+          return
+        }
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'device_revoke', { username: null, ip: meta.ip, ua: meta.ua, detail: id })
+        sendJson(res, 200, { ok: true })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device revoke')
+
+  // 给 App 换核心 launch Cookie：设备 Bearer 专用，不把 launch token 交给客户端。
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/dsh-webui-oauth/device/core-session',
+    handler: async (req, res) => {
+      try {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: '仅支持 POST' })
+          return
+        }
+        const bearer = bearerOf(req)
+        if (!bearer || !devices.findByToken(bearer)) {
+          sendJson(res, 401, { error: 'device-token-required' })
+          return
+        }
+        const conn = ctx.get('connection')
+        if (!conn || typeof conn.authenticatedUrl !== 'function') {
+          sendJson(res, 501, { error: 'connection-unavailable' })
+          return
+        }
+        const origin = requestOriginOf(req)
+        if (!origin) {
+          sendJson(res, 400, { error: 'origin-unavailable' })
+          return
+        }
+        let authority = ''
+        try { authority = new URL(origin).host } catch (e) {
+          sendJson(res, 400, { error: 'origin-invalid' })
+          return
+        }
+        let launch = ''
+        try { launch = String(conn.authenticatedUrl(origin) || '') } catch (e) { launch = '' }
+        if (!launch) {
+          sendJson(res, 500, { error: 'launch-url-unavailable' })
+          return
+        }
+        let launchPath = '/'
+        try {
+          const u = new URL(launch)
+          launchPath = u.pathname + u.search
+        } catch (e) {
+          sendJson(res, 500, { error: 'launch-url-invalid' })
+          return
+        }
+        const port = ctx.webServer.port || 3080
+        const setCookie = await new Promise((resolve) => {
+          const inner = httpRequest({
+            host: '127.0.0.1',
+            port,
+            path: launchPath,
+            method: 'GET',
+            headers: {
+              host: authority,
+              authorization: 'Bearer ' + bearer,
+              'user-agent': 'dsh-webui-oauth/device-bridge',
+            },
+          }, (r2) => {
+            const sc = r2.headers['set-cookie']
+            r2.resume()
+            resolve(sc || null)
+          })
+          inner.on('error', () => resolve(null))
+          inner.setTimeout(5000, () => { inner.destroy(); resolve(null) })
+          inner.end()
+        })
+        const list = Array.isArray(setCookie) ? setCookie : (setCookie ? [setCookie] : [])
+        let picked = null
+        for (const one of list) {
+          const pair = String(one).split(';')[0]
+          const eq = pair.indexOf('=')
+          if (eq <= 0) continue
+          const cookieName = pair.slice(0, eq).trim()
+          const cookieValue = pair.slice(eq + 1)
+          if (cookieName.startsWith('dsh-auth-')) { picked = { cookieName, cookieValue }; break }
+          if (!picked) picked = { cookieName, cookieValue }
+        }
+        if (!picked) {
+          sendJson(res, 502, { error: 'core-session-unavailable' })
+          return
+        }
+        const meta = requestMeta(req)
+        await auditLog(ctx, 'device_core_session', { username: null, ip: meta.ip, ua: meta.ua, detail: picked.cookieName })
+        sendJson(res, 200, {
+          ok: true,
+          cookie_name: picked.cookieName,
+          cookie_value: picked.cookieValue,
+          authority,
+        })
+      } catch (e) {
+        sendJson(res, 500, { error: e && e.message ? e.message : String(e) })
+      }
+    },
+  }), 'dsh-webui-oauth: device core session')
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/dsh-webui-oauth/status',
@@ -3203,6 +3816,8 @@ export async function apply(ctx) {
           remoteTrust: remoteTrustFlag,
           // 当前会话是否在 2 分钟内通过过 SSO 复验（保存/禁用/解绑可直接进行）。
           reauthActive: sessionReauthOk(req),
+          // 设备会话（App / CLI）：与浏览器会话独立的列表，仅主动吊销失效。
+          deviceSessions: devices.count(),
           // 核心兜底席位形态（handler | resource | absent | unknown）：核心升级后
           // 如果这里变成 unknown，文档请求会 404 —— 排查时先看这个字段。
           fallback: fallbackShape(ctx.webServer),

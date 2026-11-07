@@ -418,6 +418,31 @@ IdP 侧日志确认完整往返：`discovery → jwks → authorize(issued code)
 
 复现方式见 `test/oidc-redirect-matrix.test.mjs`（无需外部依赖的单元回归，已接入 `npm test`）。
 
+## 设备授权（App / CLI，OAuth 2.1 device flow）
+
+给没有浏览器 Cookie 的客户端（dsh-Go 等 App、CLI）使用的第二套凭据。流程遵循 RFC 8628，**无回调**：
+
+1. `POST /dsh-webui-oauth/device/authorize`（公开）→ `device_code`、`user_code`、`verification_uri`；
+2. 用户在浏览器打开 `verification_uri`，登录后输入 `user_code` 批准（或拒绝）；
+3. `POST /dsh-webui-oauth/device/token`（公开）轮询 → `access_token`（Bearer）。
+
+设备会话与浏览器会话**完全独立**：
+
+- 单独存放于 `devices.jsonl`，只存 token 的 SHA-256；
+- **没有过期时间**，只有显式吊销（`POST /dsh-webui-oauth/devices/revoke`）才失效；
+- 设置页「设备会话（App / CLI）」单独列表，可逐个吊销；
+- 设备 Bearer 直接通过 `checkRequest`，可访问 `/api`、`/plugins`、WebSocket 与静态资源；
+- 设备 Bearer **不能**做设备管理（列表 / 吊销 / 批准新设备只允许浏览器会话）。
+
+核心 launch Cookie 桥：
+
+`POST /dsh-webui-oauth/device/core-session`（仅设备 Bearer）在服务端内部用
+`connection.authenticatedUrl()` 换取 `dsh-auth-*` Cookie，返回
+`{cookie_name, cookie_value, authority}`；**不会把 launch token 交给客户端**。
+
+安全边界：设备 token 等价于该 dsh 的完整权限。只保存在可信设备上；丢失后立即在设置页吊销。
+公开端点有限流：待批准队列上限 1000、过期 10 分钟、轮询间隔 5 秒（`slow_down`）。
+
 ## 已知边界
 
 - **DeepSeek 官方账号登录（0.2.1+，远程回调中转）**：`/oauth/callback` **不是公开路径**，仍受会话闸门保护。上游 `@deepseek-ai/dsh-deepseek-account-platform` 的 `loginOrigin()` 只接受 `http://localhost:<port>`、`http://127.0.0.1:<port>`、`http://[::1]:<port>`（显式非零端口），不支持反代域名。插件的处理方式：

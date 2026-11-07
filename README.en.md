@@ -418,6 +418,31 @@ credentials for no reason. The login path is the opposite and must send a new se
 Reproduce with `test/oidc-redirect-matrix.test.mjs` (dependency-free unit regression,
 wired into `npm test`).
 
+## Device authorization (App / CLI, OAuth 2.1 device flow)
+
+A second credential type for clients without browser cookies (dsh-Go, CLIs), following RFC 8628
+with **no callback**:
+
+1. `POST /dsh-webui-oauth/device/authorize` (public) → `device_code`, `user_code`, `verification_uri`;
+2. the user opens `verification_uri` in a browser, signs in and approves (or denies) the code;
+3. `POST /dsh-webui-oauth/device/token` (public) polls → `access_token` (Bearer).
+
+Device sessions are **completely independent** of browser sessions:
+
+- stored in `devices.jsonl` as SHA-256 hashes only;
+- **no expiry** — only an explicit revoke (`POST /dsh-webui-oauth/devices/revoke`) invalidates them;
+- listed separately on the settings page, revocable one by one;
+- the Bearer goes through `checkRequest`, so it covers `/api`, `/plugins`, WebSockets and static assets;
+- a device Bearer **cannot** manage devices (list / revoke / approve are browser-session only).
+
+Core launch cookie bridge: `POST /dsh-webui-oauth/device/core-session` (device Bearer only) calls
+`connection.authenticatedUrl()` internally and returns `{cookie_name, cookie_value, authority}`;
+the launch token is **never** handed to the client.
+
+Security: a device token equals full control of this dsh. Keep it on trusted devices and revoke it
+immediately if lost. Public endpoints are bounded: 1000 pending codes, 10-minute expiry, 5-second poll
+interval (`slow_down`).
+
 ## Known limits
 
 - **DeepSeek official account login (0.2.1+, remote callback relay)**: `/oauth/callback` is **not**
