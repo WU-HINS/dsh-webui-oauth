@@ -891,7 +891,10 @@ class PersistentSessions {
       const out = []
       const now = Date.now()
       for (const [token, s] of this.live) {
-        if (s.expiresAt > now) out.push({ op: 'add', token, sess: s })
+        if (s.expiresAt > now) {
+          const { persistedAt, ...sess } = s
+          out.push({ op: 'add', token, sess })
+        }
       }
       writeFileSync(sessionsPath(), out.map((e) => JSON.stringify(e)).join('\n') + (out.length ? '\n' : ''), { encoding: 'utf8', mode: 0o600 })
     } catch (e) { /* 压缩失败不影响运行 */ }
@@ -982,7 +985,10 @@ class PersistentDevices {
     try {
       ensureDataDir()
       const out = []
-      for (const dev of this.live.values()) out.push({ op: 'add', dev })
+      for (const dev of this.live.values()) {
+        const { persistedAt, ...persisted } = dev
+        out.push({ op: 'add', dev: persisted })
+      }
       for (const dev of this.live.values()) {
         if (dev.revokedAt) out.push({ op: 'revoke', id: dev.id, at: dev.revokedAt })
       }
@@ -1026,11 +1032,11 @@ class PersistentDevices {
     return null
   }
 
-  touch(dev, force) {
+  touch(dev) {
     const now = Date.now()
     dev.lastUsedAt = now
-    // 每次请求都写盘会放大 IO：最多每分钟落一次；UA/IP 变化时立即落。
-    if (force || now - (dev.persistedAt || 0) >= 60000) {
+    // 每次请求都写盘会放大 IO：最多每 5 分钟落一次（内存里的字段仍然实时）。
+    if (now - (dev.persistedAt || 0) >= 300000) {
       dev.persistedAt = now
       this.append({ op: 'add', dev })
     }
@@ -3181,13 +3187,12 @@ export async function apply(ctx) {
       // 设备会话同样以当前 HTTP 请求实时刷新来源信息（IP / UA / 系统 / 浏览器）。
       const meta = requestMeta(req)
       const parsed = describeUserAgent(meta.ua)
-      const changed = dev.lastIp !== meta.ip || dev.lastUa !== meta.ua
       dev.lastIp = meta.ip
       dev.lastUa = meta.ua
       dev.os = parsed.os
       dev.browser = parsed.browser
       dev.device = parsed.device
-      devices.touch(dev, changed)
+      devices.touch(dev)
       return true
     }
     const token = cookieOf(req, COOKIE_NAME)
@@ -3203,14 +3208,14 @@ export async function apply(ctx) {
     const now = Date.now()
     const meta = requestMeta(req)
     const parsed = describeUserAgent(meta.ua)
-    const changed = s.ip !== meta.ip || s.ua !== meta.ua
     s.lastSeenAt = now
     s.ip = meta.ip
     s.ua = meta.ua
     s.os = parsed.os
     s.browserName = parsed.browser
     s.device = parsed.device
-    if (changed || now - (s.persistedAt || 0) > 60000) {
+    // 列表读内存（实时）；磁盘只做重启恢复，5 分钟落一次足够。
+    if (now - (s.persistedAt || 0) > 300000) {
       s.persistedAt = now
       sessions.append({ op: 'add', token, sess: s })
     }
@@ -3415,7 +3420,8 @@ export async function apply(ctx) {
   const REAUTH_WINDOW_MS = 2 * 60 * 1000
   const purgeExpiredOidcStates = oidcStateStore.purge
 
-  // 后台任务：过期会话清理 + enabled 状态刷新
+  // 后台任务：过期会话清理 + 每小时压缩 + enabled 状态刷新
+  let lastCompactAt = Date.now()
   const bgTimer = setInterval(async () => {
     const now = Date.now()
     for (const [k, s] of sessions.live) {
@@ -3423,6 +3429,11 @@ export async function apply(ctx) {
         if (s.expiresAt <= now) sessions.delete(k)
         else delete s.reauthAt
       }
+    }
+    // 每小时把 JSONL 重写成"当前存活状态"，防止 5 分钟一次的 add 事件无限累积。
+    if (now - lastCompactAt >= 3600000) {
+      lastCompactAt = now
+      try { sessions.compact(); devices.compact() } catch (e) { /* 压缩失败不影响运行 */ }
     }
     purgeExpiredOidcStates()
     try {
